@@ -31,6 +31,9 @@
 //!       --table my_db.products \
 //!       --schema "id:long,name:string,price:double"
 
+mod config;
+mod sync;
+
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -38,6 +41,7 @@ use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use clap::{Parser, Subcommand};
 use comfy_table::{Table, presets::UTF8_FULL};
+use config::SyncConfig;
 use futures::TryStreamExt;
 use iceberg::{
     Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent,
@@ -55,15 +59,14 @@ use iceberg::{
     writer::{
         IcebergWriter, IcebergWriterBuilder,
         base_writer::data_file_writer::DataFileWriterBuilder,
-        file_writer::{
-            ParquetWriterBuilder,
-            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
-        },
+        file_writer::{ParquetWriterBuilder, location_generator::DefaultLocationGenerator},
     },
 };
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use parquet::file::properties::WriterProperties;
+use sync::engine::SyncEngine;
+use sync::file_name::ProductionFileNameGenerator;
 
 // ─── CLI definition ──────────────────────────────────────────────────────────
 
@@ -159,6 +162,23 @@ enum Commands {
         namespace: String,
     },
 
+    /// Run sync jobs from a YAML config file
+    Sync {
+        /// Path to sync config YAML
+        #[arg(long)]
+        config: String,
+
+        /// Only run this specific job (default: all jobs in dependency order)
+        #[arg(long)]
+        job: Option<String>,
+    },
+
+    /// Start a RabbitMQ consumer loop (blocks)
+    SyncConsume {
+        /// Path to sync config YAML
+        #[arg(long)]
+        config: String,
+    },
     /// Create a new table with a simple schema
     CreateTable {
         /// Fully-qualified table: namespace.table
@@ -190,6 +210,13 @@ async fn main() -> Result<()> {
     )
     .await?;
 
+    // SyncConsume needs ownership of the catalog (Arc<C: Catalog + Send + Sync + 'static>).
+    // Handle it before the general match so we can move `catalog` into it.
+    if let Commands::SyncConsume { config } = &cli.cmd {
+        cmd_sync_consume(catalog, config).await?;
+        return Ok(());
+    }
+
     match &cli.cmd {
         Commands::ListNamespaces => cmd_list_namespaces(&catalog).await?,
         Commands::ListTables { namespace } => cmd_list_tables(&catalog, namespace).await?,
@@ -210,6 +237,8 @@ async fn main() -> Result<()> {
         Commands::CreateTable { table, schema } => {
             cmd_create_table(&catalog, table, schema).await?
         }
+        Commands::Sync { config, job } => cmd_sync(&catalog, config, job.as_deref()).await?,
+        Commands::SyncConsume { .. } => unreachable!(),
     }
 
     Ok(())
@@ -225,7 +254,7 @@ async fn connect(
     access_key_id: Option<&str>,
     secret_access_key: Option<&str>,
     session_token: Option<&str>,
-) -> Result<impl Catalog> {
+) -> Result<impl Catalog + Send + Sync + use<>> {
     let mut props = HashMap::from([
         (REST_CATALOG_PROP_URI.to_string(), uri.to_string()),
         // Both keys accepted by iceberg-rust; client.region takes precedence
@@ -468,7 +497,7 @@ async fn cmd_write(
 
     let location_gen = DefaultLocationGenerator::new(meta.clone())?;
     let file_name_gen =
-        DefaultFileNameGenerator::new("data".to_string(), None, DataFileFormat::Parquet);
+        ProductionFileNameGenerator::new("data", None::<&str>, DataFileFormat::Parquet);
 
     let parquet_builder =
         ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone());
@@ -710,4 +739,52 @@ fn json_rows_to_record_batch(rows: &[serde_json::Value], schema: &Schema) -> Res
 
     let arrow_schema = Arc::new(ArrowSchema::new(arrow_fields));
     RecordBatch::try_new(arrow_schema, columns).context("build RecordBatch")
+}
+
+// ─── Sync commands ────────────────────────────────────────────────────────────
+
+async fn cmd_sync(catalog: &impl Catalog, config_path: &str, only_job: Option<&str>) -> Result<()> {
+    let cfg = SyncConfig::from_file(config_path)?;
+    let engine = SyncEngine::new(catalog);
+
+    let jobs = cfg.ordered_jobs()?;
+    let jobs: Vec<_> = match only_job {
+        Some(name) => jobs.into_iter().filter(|j| j.name == name).collect(),
+        None => jobs,
+    };
+
+    if jobs.is_empty() {
+        println!("No jobs to run.");
+        return Ok(());
+    }
+
+    for job in jobs {
+        let source = cfg
+            .sources
+            .get(&job.source)
+            .ok_or_else(|| anyhow::anyhow!("Source '{}' not found", job.source))?;
+
+        let summary = engine.run_job(job, &source.dsn, None).await?;
+        println!(
+            "✓  {}  rows={}  watermark={:?}",
+            summary.job_name, summary.rows_written, summary.new_watermark
+        );
+    }
+
+    Ok(())
+}
+
+async fn cmd_sync_consume(
+    catalog: impl Catalog + Send + Sync + 'static,
+    config_path: &str,
+) -> Result<()> {
+    let cfg = Arc::new(SyncConfig::from_file(config_path)?);
+    let rmq = cfg
+        .rabbitmq
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No 'rabbitmq' section in config"))?;
+
+    println!("Starting RabbitMQ consumer loop.  Press Ctrl-C to stop.");
+    sync::rabbitmq::run_consumers(rmq, Arc::clone(&cfg), Arc::new(catalog)).await?;
+    Ok(())
 }

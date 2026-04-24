@@ -1,0 +1,127 @@
+# sync.example.yaml
+#
+# Illustrates a full SAP-like MM module sync with two related tables
+# and a RabbitMQ-triggered user lookup.
+#
+# Run all jobs:
+#   iceberg-cli --uri http://localhost:8181 --s3-endpoint http://localhost:9000 \
+#               sync --config sync.example.yaml
+#
+# Run one job:
+#   iceberg-cli ... sync --config sync.example.yaml --job orders
+#
+# RabbitMQ consumer (blocks):
+#   iceberg-cli ... sync-consume --config sync.example.yaml
+
+# ── Sources ───────────────────────────────────────────────────────────────────
+sources:
+  main_pg:
+    type: postgres
+    dsn: "host=localhost port=5432 dbname=shop user=app password=secret sslmode=disable"
+
+# ── Destinations ──────────────────────────────────────────────────────────────
+destinations:
+  warehouse:
+    catalog_uri:       "http://localhost:8181"
+    s3_endpoint:       "http://localhost:9000"
+    region:            "us-east-1"
+    access_key_id:     minioadmin
+    secret_access_key: minioadmin
+
+# ── Sync jobs ─────────────────────────────────────────────────────────────────
+sync_jobs:
+
+  # 1. Parent table: orders (incremental, watermark on created_at)
+  - name:       orders
+    source:      main_pg
+    destination: warehouse
+    namespace:   shop
+    table:       orders
+    sql: |
+      SELECT
+        o.id,
+        o.user_id,
+        o.status,
+        o.total_amount,
+        o.created_at,
+        o.updated_at
+      FROM orders o
+      WHERE o.updated_at > :watermark
+      ORDER BY o.updated_at ASC
+    watermark_column: updated_at
+    batch_size: 500
+    mode: incremental
+
+  # 2. Child table: order_items (N+1-safe JOIN, driven off parent watermark)
+  #    depends_on ensures orders are committed first.
+  - name:       order_items
+    source:      main_pg
+    destination: warehouse
+    namespace:   shop
+    table:       order_items
+    sql: |
+      SELECT
+        oi.id,
+        oi.order_id,
+        oi.product_id,
+        oi.quantity,
+        oi.unit_price,
+        oi.line_total,
+        o.updated_at AS order_updated_at
+      FROM order_items oi
+      INNER JOIN orders o ON o.id = oi.order_id
+      WHERE o.updated_at > :watermark
+      ORDER BY o.updated_at ASC, oi.id ASC
+    watermark_column: order_updated_at
+    depends_on: orders         # topological ordering: run after orders
+    batch_size: 1000
+    mode: incremental
+
+  # 3. Slow-changing dimension: full reload every run
+  - name:       products
+    source:      main_pg
+    destination: warehouse
+    namespace:   shop
+    table:       products
+    sql: |
+      SELECT
+        p.id,
+        p.sku,
+        p.name,
+        p.category,
+        p.unit_price,
+        p.stock_qty
+      FROM products p
+      ORDER BY p.id
+    watermark_column: ~         # no watermark for full mode
+    batch_size: 2000
+    mode: full
+
+  # 4. RabbitMQ-parameterised job: look up a single user's orders
+  #    Payload: {"user_id": 42}  → :user_id substituted in SQL
+  - name:       user_orders_on_demand
+    source:      main_pg
+    destination: warehouse
+    namespace:   shop
+    table:       user_orders_snapshot
+    sql: |
+      SELECT
+        o.id,
+        o.user_id,
+        o.status,
+        o.total_amount,
+        o.created_at
+      FROM orders o
+      WHERE o.user_id = :user_id
+      ORDER BY o.created_at DESC
+    watermark_column: ~
+    batch_size: 200
+    mode: full                  # re-snapshot for this user every trigger
+
+# ── RabbitMQ (optional) ───────────────────────────────────────────────────────
+rabbitmq:
+  uri: "amqp://guest:guest@localhost:5672/%2f"
+  queues:
+    - queue: user_sync_requests
+      job:   user_orders_on_demand
+      # Message example: {"user_id": 42}
