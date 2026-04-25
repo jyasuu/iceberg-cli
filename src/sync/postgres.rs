@@ -12,7 +12,8 @@
 
 use anyhow::{Context, Result};
 use arrow_array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -22,8 +23,7 @@ use tokio_postgres::{Client, NoTls, Row, types::Type};
 // ── Connection ────────────────────────────────────────────────────────────────
 
 pub async fn connect(dsn: &str) -> Result<Client> {
-    let (client, conn) = tokio_postgres::connect(dsn, NoTls)
-        .await
+    let (client, conn) = tokio_postgres::connect(dsn, NoTls).await
         .with_context(|| format!("Connect to Postgres: {dsn}"))?;
 
     // Drive the connection on a background task.
@@ -46,15 +46,24 @@ pub fn bind_named_params(
     sql: &str,
     params: &HashMap<String, SqlValue>,
 ) -> Result<(String, Vec<SqlValue>)> {
-    let mut out_sql = sql.to_string();
-    let mut ordered = Vec::new();
+    let mut out_sql    = sql.to_string();
+    let mut ordered    = Vec::new();
     let mut name_to_idx: HashMap<String, usize> = HashMap::new();
 
     // Find all `:name` tokens.  We scan left-to-right so $N is assigned in
     // first-encounter order, which is stable across calls.
+    // Skip `::` — that is PostgreSQL cast syntax, not a named parameter.
     let mut remaining = sql;
     while let Some(pos) = remaining.find(':') {
+        // Peek at the character immediately after the colon.
         let after = &remaining[pos + 1..];
+
+        // `::cast` — skip both colons and continue scanning after them.
+        if after.starts_with(':') {
+            remaining = &after[1..];
+            continue;
+        }
+
         let end = after
             .find(|c: char| !c.is_alphanumeric() && c != '_')
             .unwrap_or(after.len());
@@ -76,9 +85,15 @@ pub fn bind_named_params(
     }
 
     // Replace `:name` → `$N` in the SQL string.
+    // Use a negative-lookbehind equivalent: replace only `:name` that is NOT
+    // preceded by another colon.  We do this by temporarily replacing `::` with
+    // a sentinel, doing the substitutions, then restoring.
+    const SENTINEL: &str = "\x00DBLCOLON\x00";
+    out_sql = out_sql.replace("::", SENTINEL);
     for (name, idx) in &name_to_idx {
         out_sql = out_sql.replace(&format!(":{name}"), &format!("${idx}"));
     }
+    out_sql = out_sql.replace(SENTINEL, "::");
 
     Ok((out_sql, ordered))
 }
@@ -111,10 +126,8 @@ pub async fn query_to_batch(
     let pg_params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
         ordered_vals.iter().map(sql_value_to_pg).collect();
     // client.query wants &[&(dyn ToSql + Sync)]; coerce explicitly.
-    let pg_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-        .iter()
-        .map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-        .collect();
+    let pg_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+        pg_params.iter().map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
 
     let rows = client
         .query(bound_sql.as_str(), pg_refs.as_slice())
@@ -128,13 +141,15 @@ pub async fn query_to_batch(
     rows_to_batch(&rows)
 }
 
-fn sql_value_to_pg(v: &SqlValue) -> Box<dyn tokio_postgres::types::ToSql + Sync + Send> {
+fn sql_value_to_pg(
+    v: &SqlValue,
+) -> Box<dyn tokio_postgres::types::ToSql + Sync + Send> {
     match v {
-        SqlValue::Text(s) => Box::new(s.clone()),
-        SqlValue::Int(i) => Box::new(*i),
-        SqlValue::Float(f) => Box::new(*f),
+        SqlValue::Text(s)      => Box::new(s.clone()),
+        SqlValue::Int(i)       => Box::new(*i),
+        SqlValue::Float(f)     => Box::new(*f),
         SqlValue::Timestamp(t) => Box::new(*t),
-        SqlValue::Null => Box::new(Option::<String>::None),
+        SqlValue::Null         => Box::new(Option::<String>::None),
     }
 }
 
@@ -145,8 +160,8 @@ fn rows_to_batch(rows: &[Row]) -> Result<Option<RecordBatch>> {
         return Ok(None);
     }
 
-    let stmt = rows[0].columns();
-    let mut fields: Vec<Field> = Vec::with_capacity(stmt.len());
+    let stmt    = rows[0].columns();
+    let mut fields:  Vec<Field>    = Vec::with_capacity(stmt.len());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(stmt.len());
 
     for (col_idx, col) in stmt.iter().enumerate() {
@@ -180,21 +195,26 @@ fn rows_to_batch(rows: &[Row]) -> Result<Option<RecordBatch>> {
                             .map(|ts| ts.and_utc().timestamp_micros())
                     })
                     .collect();
+                // No timezone annotation: Iceberg Timestamp (non-tz) maps to
+                // Arrow Timestamp(µs, None).  inject_field_ids will add the
+                // field_id; keep the Arrow type consistent with the auto-created
+                // Iceberg schema so the writer doesn't reject the batch.
                 fields.push(Field::new(
                     &name,
-                    DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
                     true,
                 ));
-                columns.push(
-                    Arc::new(TimestampMicrosecondArray::from(vals).with_timezone("UTC"))
-                        as ArrayRef,
-                );
+                columns.push(Arc::new(TimestampMicrosecondArray::from(vals)) as ArrayRef);
             }
             _ => {
                 // Catch-all: stringify everything else.
                 let vals: Vec<Option<String>> = rows
                     .iter()
-                    .map(|r| r.try_get::<_, Option<String>>(col_idx).ok().flatten())
+                    .map(|r| {
+                        r.try_get::<_, Option<String>>(col_idx)
+                            .ok()
+                            .flatten()
+                    })
                     .collect();
                 fields.push(Field::new(&name, DataType::Utf8, true));
                 let arr: StringArray = vals.iter().map(|v| v.as_deref()).collect();
@@ -204,26 +224,25 @@ fn rows_to_batch(rows: &[Row]) -> Result<Option<RecordBatch>> {
     }
 
     let schema = Arc::new(ArrowSchema::new(fields));
-    let batch =
-        RecordBatch::try_new(schema, columns).context("Build RecordBatch from Postgres rows")?;
+    let batch  = RecordBatch::try_new(schema, columns)
+        .context("Build RecordBatch from Postgres rows")?;
     Ok(Some(batch))
 }
 
 /// Extract the maximum value of a timestamp column from a batch.
 /// Used to advance the watermark after a successful write.
-pub fn max_timestamp_in_batch(batch: &RecordBatch, column: &str) -> Option<DateTime<Utc>> {
-    let idx = batch.schema().index_of(column).ok()?;
+pub fn max_timestamp_in_batch(
+    batch: &RecordBatch,
+    column: &str,
+) -> Option<DateTime<Utc>> {
+    let idx   = batch.schema().index_of(column).ok()?;
     let array = batch.column(idx);
-    let ts_arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>()?;
+    let ts_arr = array
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()?;
 
     let max_us = (0..ts_arr.len())
-        .filter_map(|i| {
-            if ts_arr.is_null(i) {
-                None
-            } else {
-                Some(ts_arr.value(i))
-            }
-        })
+        .filter_map(|i| if ts_arr.is_null(i) { None } else { Some(ts_arr.value(i)) })
         .max()?;
 
     DateTime::from_timestamp_micros(max_us)

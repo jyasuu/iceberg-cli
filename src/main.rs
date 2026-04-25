@@ -31,17 +31,17 @@
 //!       --table my_db.products \
 //!       --schema "id:long,name:string,price:double"
 
+
 mod config;
 mod sync;
 
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
-use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use clap::{Parser, Subcommand};
 use comfy_table::{Table, presets::UTF8_FULL};
-use config::SyncConfig;
 use futures::TryStreamExt;
 use iceberg::{
     Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent,
@@ -59,7 +59,10 @@ use iceberg::{
     writer::{
         IcebergWriter, IcebergWriterBuilder,
         base_writer::data_file_writer::DataFileWriterBuilder,
-        file_writer::{ParquetWriterBuilder, location_generator::DefaultLocationGenerator},
+        file_writer::{
+            ParquetWriterBuilder,
+            location_generator::DefaultLocationGenerator,
+        },
     },
 };
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
@@ -67,6 +70,7 @@ use iceberg_storage_opendal::OpenDalStorageFactory;
 use parquet::file::properties::WriterProperties;
 use sync::engine::SyncEngine;
 use sync::file_name::ProductionFileNameGenerator;
+use config::SyncConfig;
 
 // ─── CLI definition ──────────────────────────────────────────────────────────
 
@@ -83,6 +87,12 @@ struct Cli {
 
     #[arg(long, env = "S3_ENDPOINT")]
     s3_endpoint: String,
+
+    /// S3 URL scheme used by the storage backend.
+    /// Use 's3a' for Hadoop-compatible stores (MinIO, EMR) — default.
+    /// Use 's3'  when the REST catalog rewrites URLs itself.
+    #[arg(long, env = "S3_SCHEME", default_value = "s3a")]
+    s3_scheme: String,
 
     /// AWS region for S3 (or set AWS_DEFAULT_REGION / AWS_REGION)
     #[arg(long, env = "AWS_DEFAULT_REGION", default_value = "us-east-1")]
@@ -162,6 +172,7 @@ enum Commands {
         namespace: String,
     },
 
+
     /// Run sync jobs from a YAML config file
     Sync {
         /// Path to sync config YAML
@@ -204,6 +215,7 @@ async fn main() -> Result<()> {
         &cli.catalog,
         &cli.region,
         &cli.s3_endpoint,
+        &cli.s3_scheme,
         cli.access_key_id.as_deref(),
         cli.secret_access_key.as_deref(),
         cli.session_token.as_deref(),
@@ -237,7 +249,9 @@ async fn main() -> Result<()> {
         Commands::CreateTable { table, schema } => {
             cmd_create_table(&catalog, table, schema).await?
         }
-        Commands::Sync { config, job } => cmd_sync(&catalog, config, job.as_deref()).await?,
+        Commands::Sync { config, job } => {
+            cmd_sync(&catalog, config, job.as_deref()).await?
+        }
         Commands::SyncConsume { .. } => unreachable!(),
     }
 
@@ -251,21 +265,18 @@ async fn connect(
     name: &str,
     region: &str,
     s3_endpoint: &str,
+    s3_scheme: &str,
     access_key_id: Option<&str>,
     secret_access_key: Option<&str>,
     session_token: Option<&str>,
 ) -> Result<impl Catalog + Send + Sync + use<>> {
     let mut props = HashMap::from([
         (REST_CATALOG_PROP_URI.to_string(), uri.to_string()),
-        // Both keys accepted by iceberg-rust; client.region takes precedence
         ("s3.region".to_string(), region.to_string()),
         ("s3.endpoint".to_string(), s3_endpoint.to_string()),
         ("client.region".to_string(), region.to_string()),
     ]);
 
-    // Inject credentials when explicitly provided (CLI flag or env var).
-    // If not provided we fall through to OpenDAL's standard AWS credential
-    // chain (~/.aws/credentials, instance metadata, etc.).
     if let Some(k) = access_key_id {
         props.insert("s3.access-key-id".to_string(), k.to_string());
     }
@@ -278,7 +289,7 @@ async fn connect(
 
     let catalog = RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3a".to_string(),
+            configured_scheme: s3_scheme.to_string(),
             customized_credential_load: None,
         }))
         .load(name, props)
@@ -535,11 +546,17 @@ async fn cmd_write(
 
 async fn cmd_create_namespace(catalog: &impl Catalog, namespace: &str) -> Result<()> {
     let ns = parse_namespace(namespace)?;
-    catalog
-        .create_namespace(&ns, HashMap::new())
-        .await
-        .with_context(|| format!("create_namespace({namespace})"))?;
-    println!("Created namespace '{namespace}'.");
+    match catalog.create_namespace(&ns, HashMap::new()).await {
+        Ok(_) => println!("Created namespace '{namespace}'."),
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("already exists") || msg.contains("already exist") {
+                println!("Namespace '{namespace}' already exists — skipping.");
+            } else {
+                return Err(e).with_context(|| format!("create_namespace({namespace})"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -701,13 +718,37 @@ fn json_rows_to_record_batch(rows: &[serde_json::Value], schema: &Schema) -> Res
         metadata.insert("PARQUET:field_id".to_string(), field.id.to_string());
 
         match &*field.field_type {
-            Type::Primitive(PrimitiveType::Long) | Type::Primitive(PrimitiveType::Int) => {
+            Type::Primitive(PrimitiveType::Long) => {
                 let vals: Vec<Option<i64>> = rows
                     .iter()
                     .map(|r| r.get(col).and_then(|v| v.as_i64()))
                     .collect();
                 arrow_fields.push(Field::new(col, DataType::Int64, true).with_metadata(metadata));
                 columns.push(Arc::new(Int64Array::from(vals)) as ArrayRef);
+            }
+            Type::Primitive(PrimitiveType::Int) => {
+                let vals: Vec<Option<i32>> = rows
+                    .iter()
+                    .map(|r| r.get(col).and_then(|v| v.as_i64()).map(|i| i as i32))
+                    .collect();
+                arrow_fields.push(Field::new(col, DataType::Int32, true).with_metadata(metadata));
+                columns.push(Arc::new(Int32Array::from(vals)) as ArrayRef);
+            }
+            Type::Primitive(PrimitiveType::Double) => {
+                let vals: Vec<Option<f64>> = rows
+                    .iter()
+                    .map(|r| r.get(col).and_then(|v| v.as_f64()))
+                    .collect();
+                arrow_fields.push(Field::new(col, DataType::Float64, true).with_metadata(metadata));
+                columns.push(Arc::new(Float64Array::from(vals)) as ArrayRef);
+            }
+            Type::Primitive(PrimitiveType::Float) => {
+                let vals: Vec<Option<f32>> = rows
+                    .iter()
+                    .map(|r| r.get(col).and_then(|v| v.as_f64()).map(|f| f as f32))
+                    .collect();
+                arrow_fields.push(Field::new(col, DataType::Float32, true).with_metadata(metadata));
+                columns.push(Arc::new(Float32Array::from(vals)) as ArrayRef);
             }
             Type::Primitive(PrimitiveType::String) => {
                 let vals: Vec<Option<&str>> = rows
@@ -717,13 +758,57 @@ fn json_rows_to_record_batch(rows: &[serde_json::Value], schema: &Schema) -> Res
                 arrow_fields.push(Field::new(col, DataType::Utf8, true).with_metadata(metadata));
                 columns.push(Arc::new(StringArray::from(vals)) as ArrayRef);
             }
-            Type::Primitive(PrimitiveType::Double) | Type::Primitive(PrimitiveType::Float) => {
-                let vals: Vec<Option<f64>> = rows
+            Type::Primitive(PrimitiveType::Boolean) => {
+                let vals: Vec<Option<bool>> = rows
                     .iter()
-                    .map(|r| r.get(col).and_then(|v| v.as_f64()))
+                    .map(|r| r.get(col).and_then(|v| v.as_bool()))
                     .collect();
-                arrow_fields.push(Field::new(col, DataType::Float64, true).with_metadata(metadata));
-                columns.push(Arc::new(Float64Array::from(vals)) as ArrayRef);
+                arrow_fields.push(Field::new(col, DataType::Boolean, true).with_metadata(metadata));
+                columns.push(Arc::new(BooleanArray::from(vals)) as ArrayRef);
+            }
+            Type::Primitive(PrimitiveType::Date) => {
+                // JSON representation: "YYYY-MM-DD" string or null.
+                // Arrow Date32 = days since Unix epoch.
+                use arrow_array::Date32Array;
+                let vals: Vec<Option<i32>> = rows
+                    .iter()
+                    .map(|r| {
+                        r.get(col)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| {
+                                chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+                            })
+                            .map(|d| {
+                                d.signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+                                    .num_days() as i32
+                            })
+                    })
+                    .collect();
+                arrow_fields.push(Field::new(col, DataType::Date32, true).with_metadata(metadata));
+                columns.push(Arc::new(Date32Array::from(vals)) as ArrayRef);
+            }
+            Type::Primitive(PrimitiveType::Timestamp)
+            | Type::Primitive(PrimitiveType::Timestamptz) => {
+                // JSON representation: RFC-3339 string or null.
+                use arrow_array::TimestampMicrosecondArray;
+                let vals: Vec<Option<i64>> = rows
+                    .iter()
+                    .map(|r| {
+                        r.get(col)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                            .map(|dt| dt.timestamp_micros())
+                    })
+                    .collect();
+                // No timezone annotation — Iceberg PrimitiveType::Timestamp maps to
+                // Arrow Timestamp(µs) without tz.  Timestamptz would need "UTC" but
+                // the auto-create schema uses Timestamp, so keep them consistent.
+                arrow_fields.push(Field::new(
+                    col,
+                    DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                    true,
+                ).with_metadata(metadata));
+                columns.push(Arc::new(TimestampMicrosecondArray::from(vals)) as ArrayRef);
             }
             _ => {
                 let vals: Vec<Option<String>> = rows
@@ -750,7 +835,7 @@ async fn cmd_sync(catalog: &impl Catalog, config_path: &str, only_job: Option<&s
     let jobs = cfg.ordered_jobs()?;
     let jobs: Vec<_> = match only_job {
         Some(name) => jobs.into_iter().filter(|j| j.name == name).collect(),
-        None => jobs,
+        None       => jobs,
     };
 
     if jobs.is_empty() {
@@ -759,15 +844,15 @@ async fn cmd_sync(catalog: &impl Catalog, config_path: &str, only_job: Option<&s
     }
 
     for job in jobs {
-        let source = cfg
-            .sources
-            .get(&job.source)
+        let source = cfg.sources.get(&job.source)
             .ok_or_else(|| anyhow::anyhow!("Source '{}' not found", job.source))?;
 
         let summary = engine.run_job(job, &source.dsn, None).await?;
         println!(
             "✓  {}  rows={}  watermark={:?}",
-            summary.job_name, summary.rows_written, summary.new_watermark
+            summary.job_name,
+            summary.rows_written,
+            summary.new_watermark
         );
     }
 
@@ -779,9 +864,7 @@ async fn cmd_sync_consume(
     config_path: &str,
 ) -> Result<()> {
     let cfg = Arc::new(SyncConfig::from_file(config_path)?);
-    let rmq = cfg
-        .rabbitmq
-        .as_ref()
+    let rmq = cfg.rabbitmq.as_ref()
         .ok_or_else(|| anyhow::anyhow!("No 'rabbitmq' section in config"))?;
 
     println!("Starting RabbitMQ consumer loop.  Press Ctrl-C to stop.");

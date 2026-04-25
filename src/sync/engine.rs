@@ -21,14 +21,18 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use chrono::{DateTime, Utc};
 use iceberg::{
-    Catalog, NamespaceIdent, TableCreation, TableIdent,
+    Catalog,
+    NamespaceIdent,
+    TableCreation,
+    TableIdent,
     spec::{DataFileFormat, NestedField, PrimitiveType, Schema as IcebergSchema, Type},
     transaction::{ApplyTransactionAction, Transaction},
     writer::{
         IcebergWriter, IcebergWriterBuilder,
         base_writer::data_file_writer::DataFileWriterBuilder,
         file_writer::{
-            ParquetWriterBuilder, location_generator::DefaultLocationGenerator,
+            ParquetWriterBuilder,
+            location_generator::DefaultLocationGenerator,
             rolling_writer::RollingFileWriterBuilder,
         },
     },
@@ -93,12 +97,14 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
             // First run: substitute a very old timestamp so all rows are fetched.
             params.insert(
                 "watermark".to_string(),
-                SqlValue::Timestamp(DateTime::from_timestamp(0, 0).unwrap_or_else(Utc::now)),
+                SqlValue::Timestamp(
+                    DateTime::from_timestamp(0, 0).unwrap_or_else(Utc::now),
+                ),
             );
         }
 
         // ── 3. Fetch & write in batches ───────────────────────────────────────
-        let mut total_rows: usize = 0;
+        let mut total_rows:    usize             = 0;
         let mut new_watermark: Option<DateTime<Utc>> = watermark;
 
         // We page using LIMIT / OFFSET injected around the caller's SQL.
@@ -112,31 +118,29 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
             let batch = query_to_batch(&pg, &paged_sql, &params).await?;
 
             match batch {
-                None => break, // no more rows
+                None => break,  // no more rows
                 Some(rb) => {
                     let n = rb.num_rows();
-                    if n == 0 {
-                        break;
-                    }
+                    if n == 0 { break; }
 
                     // Track the maximum watermark seen in this batch.
                     if let Some(col) = &job.watermark_column {
                         if let Some(ts) = max_timestamp_in_batch(&rb, col) {
                             new_watermark = Some(match new_watermark {
                                 Some(prev) => prev.max(ts),
-                                None => ts,
+                                None       => ts,
                             });
                         }
                     }
 
-                    self.write_batch_atomic(job, rb, &new_watermark)
-                        .await
-                        .with_context(|| {
-                            format!("Write batch offset={offset} for job '{}'", job.name)
-                        })?;
+                    self.write_batch_atomic(job, rb, &new_watermark).await
+                        .with_context(|| format!(
+                            "Write batch offset={offset} for job '{}'",
+                            job.name
+                        ))?;
 
                     total_rows += n;
-                    offset += n;
+                    offset     += n;
 
                     info!(job = %job.name, rows = n, offset, "Batch committed");
 
@@ -150,8 +154,8 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         info!(job = %job.name, total_rows, "Job complete");
 
         Ok(RunSummary {
-            job_name: job.name.clone(),
-            rows_written: total_rows,
+            job_name:      job.name.clone(),
+            rows_written:  total_rows,
             new_watermark,
         })
     }
@@ -169,16 +173,20 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         // Ensure the table exists (create on first run).
         self.ensure_table(&ident, &batch).await?;
 
-        let table = self
-            .catalog
-            .load_table(&ident)
-            .await
+        let table = self.catalog.load_table(&ident).await
             .with_context(|| format!("load_table {ident}"))?;
 
-        let meta = table.metadata();
+        let meta   = table.metadata();
         let schema = meta.current_schema();
 
-        let loc_gen = DefaultLocationGenerator::new(meta.clone())?;
+        // The Iceberg Parquet writer requires every Arrow field to carry a
+        // `PARQUET:field_id` metadata entry whose value matches the field ID
+        // in the Iceberg schema.  Batches from postgres.rs carry no such
+        // metadata, so we rebuild the Arrow schema here with the IDs injected.
+        let batch = inject_field_ids(batch, schema)
+            .context("inject Iceberg field IDs into batch")?;
+
+        let loc_gen  = DefaultLocationGenerator::new(meta.clone())?;
         let name_gen = ProductionFileNameGenerator::new(
             "data",
             Some(job.name.as_str()),
@@ -196,7 +204,9 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
             name_gen,
         );
 
-        let mut writer = DataFileWriterBuilder::new(rolling).build(None).await?;
+        let mut writer = DataFileWriterBuilder::new(rolling)
+            .build(None)
+            .await?;
 
         writer.write(batch).await?;
         let data_files = writer.close().await?;
@@ -218,7 +228,10 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         let tx = Transaction::new(&table);
 
         // Step 1 — append the data file
-        let tx = tx.fast_append().add_data_files(data_files).apply(tx)?;
+        let tx = tx
+            .fast_append()
+            .add_data_files(data_files)
+            .apply(tx)?;
 
         // Step 2 — record watermark + run stats as table properties
         let mut props_action = tx.update_table_properties();
@@ -266,24 +279,64 @@ fn table_ident(namespace: &str, table: &str) -> Result<TableIdent> {
     Ok(TableIdent::new(ns, table.to_string()))
 }
 
-/// Derive an Iceberg schema from an Arrow schema.
-/// Used for auto-table-creation on the first sync run.
+/// Re-build a `RecordBatch` with `PARQUET:field_id` metadata injected into
+/// every Arrow field, matched by column name against the Iceberg schema.
+///
+/// The Iceberg Parquet writer uses these IDs to correlate Arrow columns with
+/// Iceberg fields.  Without them it raises "Field id N not found in struct array".
+fn inject_field_ids(
+    batch: RecordBatch,
+    schema: &IcebergSchema,
+) -> Result<RecordBatch> {
+    use arrow_schema::Field;
+    use std::sync::Arc;
+
+    let old_arrow = batch.schema();
+    let mut new_fields: Vec<Field> = Vec::with_capacity(old_arrow.fields().len());
+
+    for arrow_field in old_arrow.fields().iter() {
+        // Find the matching Iceberg field by name (case-sensitive).
+        let iceberg_field = schema
+            .as_struct()
+            .fields()
+            .iter()
+            .find(|f| f.name == *arrow_field.name())
+            .with_context(|| format!(
+                "Column '{}' in query result has no matching field in Iceberg schema",
+                arrow_field.name()
+            ))?;
+
+        let mut meta = arrow_field.metadata().clone();
+        meta.insert("PARQUET:field_id".to_string(), iceberg_field.id.to_string());
+
+        new_fields.push(arrow_field.as_ref().clone().with_metadata(meta));
+    }
+
+    let new_schema = Arc::new(
+        ArrowSchema::new(new_fields)
+            .with_metadata(old_arrow.metadata().clone())
+    );
+
+    RecordBatch::try_new(new_schema, batch.columns().to_vec())
+        .context("Rebuild RecordBatch with injected field IDs")
+}
 fn arrow_schema_to_iceberg(arrow: &ArrowSchema) -> Result<IcebergSchema> {
     use arrow_schema::DataType;
 
     let mut fields = Vec::new();
     for (idx, f) in arrow.fields().iter().enumerate() {
-        let field_id = (idx + 1) as i32;
+        let field_id  = (idx + 1) as i32;
         let iceberg_t = match f.data_type() {
-            DataType::Int8 | DataType::Int16 | DataType::Int32 => {
+            DataType::Int8  | DataType::Int16 | DataType::Int32 => {
                 Type::Primitive(PrimitiveType::Int)
             }
-            DataType::Int64 => Type::Primitive(PrimitiveType::Long),
+            DataType::Int64  => Type::Primitive(PrimitiveType::Long),
             DataType::Float32 => Type::Primitive(PrimitiveType::Float),
             DataType::Float64 => Type::Primitive(PrimitiveType::Double),
             DataType::Boolean => Type::Primitive(PrimitiveType::Boolean),
             DataType::Date32 | DataType::Date64 => Type::Primitive(PrimitiveType::Date),
-            DataType::Timestamp(_, _) => Type::Primitive(PrimitiveType::Timestamp),
+            DataType::Timestamp(_, Some(_)) => Type::Primitive(PrimitiveType::Timestamptz),
+            DataType::Timestamp(_, None)    => Type::Primitive(PrimitiveType::Timestamp),
             _ => Type::Primitive(PrimitiveType::String), // fallback
         };
         fields.push(NestedField::optional(field_id, f.name(), iceberg_t).into());

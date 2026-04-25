@@ -55,18 +55,18 @@
 //!       # payload {"user_id": 42} → SELECT … WHERE user_id = :user_id
 //! ```
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 
 // ── Top-level ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SyncConfig {
-    pub sources: HashMap<String, SourceConfig>,
+    pub sources:      HashMap<String, SourceConfig>,
     pub destinations: HashMap<String, DestinationConfig>,
-    pub sync_jobs: Vec<SyncJob>,
+    pub sync_jobs:    Vec<SyncJob>,
     #[serde(default)]
-    pub rabbitmq: Option<RabbitMqConfig>,
+    pub rabbitmq:     Option<RabbitMqConfig>,
 }
 
 impl SyncConfig {
@@ -84,21 +84,18 @@ impl SyncConfig {
             anyhow::ensure!(
                 self.sources.contains_key(&job.source),
                 "Job '{}' references unknown source '{}'",
-                job.name,
-                job.source
+                job.name, job.source
             );
             anyhow::ensure!(
                 self.destinations.contains_key(&job.destination),
                 "Job '{}' references unknown destination '{}'",
-                job.name,
-                job.destination
+                job.name, job.destination
             );
             if let Some(dep) = &job.depends_on {
                 anyhow::ensure!(
                     self.sync_jobs.iter().any(|j| &j.name == dep),
                     "Job '{}' depends_on unknown job '{}'",
-                    job.name,
-                    dep
+                    job.name, dep
                 );
             }
         }
@@ -119,9 +116,7 @@ impl SyncConfig {
             if visited.contains(name) {
                 return Ok(());
             }
-            let job = jobs
-                .iter()
-                .find(|j| j.name == name)
+            let job = jobs.iter().find(|j| j.name == name)
                 .ok_or_else(|| anyhow::anyhow!("Job '{}' not found", name))?;
             if let Some(dep) = &job.depends_on {
                 visit(dep, jobs, visited, result)?;
@@ -158,33 +153,29 @@ pub enum SourceType {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DestinationConfig {
-    pub catalog_uri: String,
-    pub s3_endpoint: String,
+    pub catalog_uri:       String,
+    pub s3_endpoint:       String,
     #[serde(default = "default_region")]
-    pub region: String,
-    pub access_key_id: Option<String>,
+    pub region:            String,
+    pub access_key_id:     Option<String>,
     pub secret_access_key: Option<String>,
-    pub session_token: Option<String>,
+    pub session_token:     Option<String>,
     #[serde(default = "default_catalog_name")]
-    pub catalog_name: String,
+    pub catalog_name:      String,
 }
 
-fn default_region() -> String {
-    "us-east-1".to_string()
-}
-fn default_catalog_name() -> String {
-    "default".to_string()
-}
+fn default_region()       -> String { "us-east-1".to_string() }
+fn default_catalog_name() -> String { "default".to_string() }
 
 // ── Sync job ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SyncJob {
-    pub name: String,
-    pub source: String,
+    pub name:        String,
+    pub source:      String,
     pub destination: String,
-    pub namespace: String,
-    pub table: String,
+    pub namespace:   String,
+    pub table:       String,
 
     /// Custom SQL for the query. Use `:watermark` as the placeholder for
     /// incremental mode and `:param_name` for RabbitMQ-driven queries.
@@ -203,9 +194,7 @@ pub struct SyncJob {
     pub mode: SyncMode,
 }
 
-fn default_batch_size() -> usize {
-    500
-}
+fn default_batch_size() -> usize { 500 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -221,7 +210,7 @@ pub enum SyncMode {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RabbitMqConfig {
-    pub uri: String,
+    pub uri:    String,
     pub queues: Vec<QueueBinding>,
 }
 
@@ -231,5 +220,5 @@ pub struct RabbitMqConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct QueueBinding {
     pub queue: String,
-    pub job: String,
+    pub job:   String,
 }
