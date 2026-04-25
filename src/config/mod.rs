@@ -43,21 +43,21 @@
 //! Tag jobs with a group name to run just that cohort:
 //! `iceberg-cli sync --group orders_pipeline`
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ── Top-level ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SyncConfig {
-    pub sources:      HashMap<String, SourceConfig>,
+    pub sources: HashMap<String, SourceConfig>,
     pub destinations: HashMap<String, DestinationConfig>,
-    pub sync_jobs:    Vec<SyncJob>,
+    pub sync_jobs: Vec<SyncJob>,
     /// Global retry policy — can be overridden per job.
     #[serde(default)]
-    pub retry:        RetryConfig,
+    pub retry: RetryConfig,
     #[serde(default)]
-    pub rabbitmq:     Option<RabbitMqConfig>,
+    pub rabbitmq: Option<RabbitMqConfig>,
 }
 
 impl SyncConfig {
@@ -75,18 +75,21 @@ impl SyncConfig {
             anyhow::ensure!(
                 self.sources.contains_key(&job.source),
                 "Job '{}' references unknown source '{}'",
-                job.name, job.source
+                job.name,
+                job.source
             );
             anyhow::ensure!(
                 self.destinations.contains_key(&job.destination),
                 "Job '{}' references unknown destination '{}'",
-                job.name, job.destination
+                job.name,
+                job.destination
             );
             if let Some(dep) = &job.depends_on {
                 anyhow::ensure!(
                     self.sync_jobs.iter().any(|j| &j.name == dep),
                     "Job '{}' depends_on unknown job '{}'",
-                    job.name, dep
+                    job.name,
+                    dep
                 );
             }
             if job.cursor_column.is_some() && job.mode == SyncMode::Full {
@@ -103,18 +106,21 @@ impl SyncConfig {
     fn detect_cycles(&self) -> anyhow::Result<()> {
         use std::collections::HashSet;
         let mut visiting: HashSet<&str> = HashSet::new();
-        let mut visited:  HashSet<&str> = HashSet::new();
+        let mut visited: HashSet<&str> = HashSet::new();
 
         fn dfs<'a>(
             name: &'a str,
             jobs: &'a [SyncJob],
             visiting: &mut HashSet<&'a str>,
-            visited:  &mut HashSet<&'a str>,
+            visited: &mut HashSet<&'a str>,
         ) -> anyhow::Result<()> {
-            if visited.contains(name) { return Ok(()); }
+            if visited.contains(name) {
+                return Ok(());
+            }
             anyhow::ensure!(
                 !visiting.contains(name),
-                "Dependency cycle detected involving job '{}'", name
+                "Dependency cycle detected involving job '{}'",
+                name
             );
             visiting.insert(name);
             if let Some(job) = jobs.iter().find(|j| j.name == name) {
@@ -135,17 +141,21 @@ impl SyncConfig {
 
     /// Jobs sorted so dependencies run before dependents (topological).
     pub fn ordered_jobs(&self) -> anyhow::Result<Vec<&SyncJob>> {
-        let mut result:  Vec<&SyncJob> = Vec::new();
+        let mut result: Vec<&SyncJob> = Vec::new();
         let mut visited: std::collections::HashSet<&str> = Default::default();
 
         fn visit<'a>(
-            name:    &'a str,
-            jobs:    &'a [SyncJob],
+            name: &'a str,
+            jobs: &'a [SyncJob],
             visited: &mut std::collections::HashSet<&'a str>,
-            result:  &mut Vec<&'a SyncJob>,
+            result: &mut Vec<&'a SyncJob>,
         ) -> anyhow::Result<()> {
-            if visited.contains(name) { return Ok(()); }
-            let job = jobs.iter().find(|j| j.name == name)
+            if visited.contains(name) {
+                return Ok(());
+            }
+            let job = jobs
+                .iter()
+                .find(|j| j.name == name)
                 .ok_or_else(|| anyhow::anyhow!("Job '{}' not found", name))?;
             if let Some(dep) = &job.depends_on {
                 visit(dep, jobs, visited, result)?;
@@ -164,7 +174,10 @@ impl SyncConfig {
     /// Jobs filtered by group name, topologically ordered.
     pub fn ordered_jobs_for_group<'a>(&'a self, group: &str) -> anyhow::Result<Vec<&'a SyncJob>> {
         let all = self.ordered_jobs()?;
-        Ok(all.into_iter().filter(|j| j.group.as_deref() == Some(group)).collect())
+        Ok(all
+            .into_iter()
+            .filter(|j| j.group.as_deref() == Some(group))
+            .collect())
     }
 
     /// Effective retry policy for a job (job-level overrides global).
@@ -192,19 +205,23 @@ pub enum SourceType {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DestinationConfig {
-    pub catalog_uri:       String,
-    pub s3_endpoint:       String,
+    pub catalog_uri: String,
+    pub s3_endpoint: String,
     #[serde(default = "default_region")]
-    pub region:            String,
-    pub access_key_id:     Option<String>,
+    pub region: String,
+    pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
-    pub session_token:     Option<String>,
+    pub session_token: Option<String>,
     #[serde(default = "default_catalog_name")]
-    pub catalog_name:      String,
+    pub catalog_name: String,
 }
 
-fn default_region()       -> String { "us-east-1".to_string() }
-fn default_catalog_name() -> String { "default".to_string() }
+fn default_region() -> String {
+    "us-east-1".to_string()
+}
+fn default_catalog_name() -> String {
+    "default".to_string()
+}
 
 // ── Retry policy ──────────────────────────────────────────────────────────────
 
@@ -224,16 +241,22 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_attempts:       default_max_attempts(),
-            initial_delay_ms:   default_initial_delay_ms(),
+            max_attempts: default_max_attempts(),
+            initial_delay_ms: default_initial_delay_ms(),
             backoff_multiplier: default_backoff_multiplier(),
         }
     }
 }
 
-fn default_max_attempts()       -> u32 { 3 }
-fn default_initial_delay_ms()   -> u64 { 500 }
-fn default_backoff_multiplier() -> f64 { 2.0 }
+fn default_max_attempts() -> u32 {
+    3
+}
+fn default_initial_delay_ms() -> u64 {
+    500
+}
+fn default_backoff_multiplier() -> f64 {
+    2.0
+}
 
 // ── Schema evolution ──────────────────────────────────────────────────────────
 
@@ -249,11 +272,11 @@ pub struct SchemaEvolutionConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SyncJob {
-    pub name:        String,
-    pub source:      String,
+    pub name: String,
+    pub source: String,
     pub destination: String,
-    pub namespace:   String,
-    pub table:       String,
+    pub namespace: String,
+    pub table: String,
 
     /// Optional group tag — run cohorts with `--group <name>`.
     pub group: Option<String>,
@@ -295,7 +318,9 @@ pub struct SyncJob {
     pub retry: Option<RetryConfig>,
 }
 
-fn default_batch_size() -> usize { 500 }
+fn default_batch_size() -> usize {
+    500
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -309,14 +334,14 @@ pub enum SyncMode {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RabbitMqConfig {
-    pub uri:    String,
+    pub uri: String,
     pub queues: Vec<QueueBinding>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct QueueBinding {
     pub queue: String,
-    pub job:   String,
+    pub job: String,
     /// Dead-letter exchange for nacked messages.
     pub dead_letter_exchange: Option<String>,
 }

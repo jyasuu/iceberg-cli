@@ -10,8 +10,8 @@ use chrono::{DateTime, Utc};
 use iceberg::{Catalog, TableIdent};
 use std::collections::HashMap;
 
-const KEY_LAST_RUN_AT:    &str = "sync.last_run_at";
-const KEY_LAST_RUN_ROWS:  &str = "sync.last_run_rows";
+const KEY_LAST_RUN_AT: &str = "sync.last_run_at";
+const KEY_LAST_RUN_ROWS: &str = "sync.last_run_rows";
 
 fn watermark_key(column: &str) -> String {
     format!("sync.watermark.{column}")
@@ -30,7 +30,10 @@ pub async fn read_watermark(
         Ok(t) => t,
         Err(e) => {
             let msg = e.to_string().to_lowercase();
-            if msg.contains("does not exist") || msg.contains("not found") || msg.contains("no such") {
+            if msg.contains("does not exist")
+                || msg.contains("not found")
+                || msg.contains("no such")
+            {
                 return Ok(None); // first run — table will be created on write
             }
             return Err(e).with_context(|| format!("load_table for watermark read: {ident}"));
@@ -38,11 +41,12 @@ pub async fn read_watermark(
     };
 
     let props = table.metadata().properties();
-    let key   = watermark_key(column);
+    let key = watermark_key(column);
 
     match props.get(&key) {
         Some(raw) => {
-            let ts = raw.parse::<DateTime<Utc>>()
+            let ts = raw
+                .parse::<DateTime<Utc>>()
                 .with_context(|| format!("Invalid watermark value '{raw}' for key '{key}'"))?;
             Ok(Some(ts))
         }
@@ -61,14 +65,8 @@ pub fn build_metadata_updates(
 ) -> HashMap<String, String> {
     let mut updates = HashMap::new();
 
-    updates.insert(
-        KEY_LAST_RUN_AT.to_string(),
-        Utc::now().to_rfc3339(),
-    );
-    updates.insert(
-        KEY_LAST_RUN_ROWS.to_string(),
-        rows_written.to_string(),
-    );
+    updates.insert(KEY_LAST_RUN_AT.to_string(), Utc::now().to_rfc3339());
+    updates.insert(KEY_LAST_RUN_ROWS.to_string(), rows_written.to_string());
 
     if let (Some(col), Some(ts)) = (column, watermark) {
         updates.insert(watermark_key(col), ts.to_rfc3339());
@@ -80,7 +78,7 @@ pub fn build_metadata_updates(
 /// Summary returned after a sync run completes.
 #[derive(Debug, Clone)]
 pub struct RunSummary {
-    pub job_name:     String,
+    pub job_name: String,
     pub rows_written: usize,
     pub new_watermark: Option<DateTime<Utc>>,
 }

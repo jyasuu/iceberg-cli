@@ -34,9 +34,9 @@ impl ProductionFileNameGenerator {
     fn extension(&self) -> &'static str {
         match self.format {
             DataFileFormat::Parquet => "parquet",
-            DataFileFormat::Avro    => "avro",
-            DataFileFormat::Orc     => "orc",
-            DataFileFormat::Puffin  => "puffin",
+            DataFileFormat::Avro => "avro",
+            DataFileFormat::Orc => "orc",
+            DataFileFormat::Puffin => "puffin",
         }
     }
 }
@@ -44,12 +44,19 @@ impl ProductionFileNameGenerator {
 // Correct trait method name is `generate_file_name`, not `generate`.
 impl FileNameGenerator for ProductionFileNameGenerator {
     fn generate_file_name(&self) -> String {
-        let ts  = chrono::Utc::now().timestamp_millis();
+        let ts = chrono::Utc::now().timestamp_millis();
         let uid = Uuid::new_v4().simple();
 
         match &self.suffix {
-            Some(suf) => format!("{}-{}-{}-{}.{}", self.prefix, ts, uid, suf, self.extension()),
-            None      => format!("{}-{}-{}.{}",    self.prefix, ts, uid,      self.extension()),
+            Some(suf) => format!(
+                "{}-{}-{}-{}.{}",
+                self.prefix,
+                ts,
+                uid,
+                suf,
+                self.extension()
+            ),
+            None => format!("{}-{}-{}.{}", self.prefix, ts, uid, self.extension()),
         }
     }
 }

@@ -49,8 +49,7 @@ use iceberg::{
         IcebergWriter, IcebergWriterBuilder,
         base_writer::data_file_writer::DataFileWriterBuilder,
         file_writer::{
-            ParquetWriterBuilder,
-            location_generator::DefaultLocationGenerator,
+            ParquetWriterBuilder, location_generator::DefaultLocationGenerator,
             rolling_writer::RollingFileWriterBuilder,
         },
     },
@@ -62,7 +61,9 @@ use crate::config::{RetryConfig, SchemaEvolutionConfig, SyncJob, SyncMode};
 use crate::sync::{
     file_name::ProductionFileNameGenerator,
     metadata::{RunSummary, build_metadata_updates, read_watermark},
-    postgres::{SqlValue, connect as pg_connect, max_int_in_batch, max_timestamp_in_batch, query_to_batch},
+    postgres::{
+        SqlValue, connect as pg_connect, max_int_in_batch, max_timestamp_in_batch, query_to_batch,
+    },
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -75,11 +76,17 @@ pub struct SyncEngine<'a, C: Catalog> {
 
 impl<'a, C: Catalog> SyncEngine<'a, C> {
     pub fn new(catalog: &'a C) -> Self {
-        Self { catalog, dry_run: false }
+        Self {
+            catalog,
+            dry_run: false,
+        }
     }
 
     pub fn with_dry_run(catalog: &'a C) -> Self {
-        Self { catalog, dry_run: true }
+        Self {
+            catalog,
+            dry_run: true,
+        }
     }
 
     /// Run a single sync job end-to-end with retry.
@@ -128,7 +135,7 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         pg_dsn: &str,
         extra_params: Option<HashMap<String, SqlValue>>,
     ) -> Result<RunSummary> {
-        let pg    = pg_connect(pg_dsn).await?;
+        let pg = pg_connect(pg_dsn).await?;
         let ident = table_ident(&job.namespace, &job.table)?;
 
         // ── 1. Resolve watermark ──────────────────────────────────────────────
@@ -158,19 +165,17 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         } else {
             params.insert(
                 "watermark".to_string(),
-                SqlValue::Timestamp(
-                    DateTime::from_timestamp(0, 0).unwrap_or_else(Utc::now),
-                ),
+                SqlValue::Timestamp(DateTime::from_timestamp(0, 0).unwrap_or_else(Utc::now)),
             );
         }
 
         // ── 3. Fetch & write in batches ───────────────────────────────────────
-        let mut total_rows:    usize                = 0;
+        let mut total_rows: usize = 0;
         let mut new_watermark: Option<DateTime<Utc>> = watermark;
 
         // Cursor pagination state (i64::MIN = "before all rows").
-        let mut cursor_value: i64  = i64::MIN;
-        let mut offset:       usize = 0;  // fallback OFFSET when no cursor col
+        let mut cursor_value: i64 = i64::MIN;
+        let mut offset: usize = 0; // fallback OFFSET when no cursor col
 
         loop {
             // Inject cursor param so bind_named_params can resolve :_cursor.
@@ -187,14 +192,16 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
                 None => break,
                 Some(rb) => {
                     let n = rb.num_rows();
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
 
                     // Advance watermark.
                     if let Some(col) = &job.watermark_column {
                         if let Some(ts) = max_timestamp_in_batch(&rb, col) {
                             new_watermark = Some(match new_watermark {
                                 Some(prev) => prev.max(ts),
-                                None       => ts,
+                                None => ts,
                             });
                         }
                     }
@@ -215,11 +222,15 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
                             "[dry-run] would commit batch (skipped)"
                         );
                     } else {
-                        self.write_batch_atomic(job, rb, &new_watermark).await
-                            .with_context(|| format!(
-                                "Write batch (cursor={cursor_value}, offset={offset}) \
-                                 for job '{}'", job.name
-                            ))?;
+                        self.write_batch_atomic(job, rb, &new_watermark)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Write batch (cursor={cursor_value}, offset={offset}) \
+                                 for job '{}'",
+                                    job.name
+                                )
+                            })?;
                     }
 
                     total_rows += n;
@@ -235,8 +246,8 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         info!(job = %job.name, total_rows, "Job complete");
 
         Ok(RunSummary {
-            job_name:      job.name.clone(),
-            rows_written:  total_rows,
+            job_name: job.name.clone(),
+            rows_written: total_rows,
             new_watermark,
         })
     }
@@ -255,18 +266,22 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
 
         // Schema evolution: add new columns before writing.
         if job.schema_evolution.allow_add_columns {
-            self.evolve_schema(&ident, &batch, &job.schema_evolution).await?;
+            self.evolve_schema(&ident, &batch, &job.schema_evolution)
+                .await?;
         }
 
-        let table  = self.catalog.load_table(&ident).await
+        let table = self
+            .catalog
+            .load_table(&ident)
+            .await
             .with_context(|| format!("load_table {ident}"))?;
-        let meta   = table.metadata();
+        let meta = table.metadata();
         let schema = meta.current_schema();
 
-        let batch  = inject_field_ids(batch, schema)
-            .context("inject Iceberg field IDs into batch")?;
+        let batch =
+            inject_field_ids(batch, schema).context("inject Iceberg field IDs into batch")?;
 
-        let loc_gen  = DefaultLocationGenerator::new(meta.clone())?;
+        let loc_gen = DefaultLocationGenerator::new(meta.clone())?;
         let name_gen = ProductionFileNameGenerator::new(
             "data",
             Some(job.name.as_str()),
@@ -284,25 +299,16 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
             name_gen,
         );
 
-        let mut writer = DataFileWriterBuilder::new(rolling)
-            .build(None)
-            .await?;
+        let mut writer = DataFileWriterBuilder::new(rolling).build(None).await?;
 
         writer.write(batch).await?;
         let data_files = writer.close().await?;
 
-        let meta_updates = build_metadata_updates(
-            job.watermark_column.as_deref(),
-            *watermark,
-            0,
-        );
+        let meta_updates = build_metadata_updates(job.watermark_column.as_deref(), *watermark, 0);
 
         let tx = Transaction::new(&table);
 
-        let tx = tx
-            .fast_append()
-            .add_data_files(data_files)
-            .apply(tx)?;
+        let tx = tx.fast_append().add_data_files(data_files).apply(tx)?;
 
         let mut props_action = tx.update_table_properties();
         for (k, v) in meta_updates {
@@ -335,13 +341,18 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         batch: &RecordBatch,
         _cfg: &SchemaEvolutionConfig,
     ) -> Result<()> {
-        let table = self.catalog.load_table(ident).await
+        let table = self
+            .catalog
+            .load_table(ident)
+            .await
             .with_context(|| format!("load_table for schema evolution: {ident}"))?;
         let iceberg_schema = table.metadata().current_schema();
 
         // Bind schema to a local so the Arc isn't dropped mid-borrow.
         let batch_schema = batch.schema();
-        let new_column_names: Vec<String> = batch_schema.fields().iter()
+        let new_column_names: Vec<String> = batch_schema
+            .fields()
+            .iter()
             .filter(|f| {
                 iceberg_schema
                     .as_struct()
@@ -410,10 +421,7 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
 /// ```sql
 /// SELECT * FROM (<user_sql>) _q LIMIT <batch_size> OFFSET <offset>
 /// ```
-fn build_paged_sql(
-    job: &SyncJob,
-    offset: usize,
-) -> String {
+fn build_paged_sql(job: &SyncJob, offset: usize) -> String {
     if let Some(col) = &job.cursor_column {
         // Cursor mode: `:_cursor` is injected into params by the caller loop.
         format!(
@@ -438,10 +446,7 @@ fn table_ident(namespace: &str, table: &str) -> Result<TableIdent> {
 
 /// Re-build a `RecordBatch` with `PARQUET:field_id` metadata injected into
 /// every Arrow field, matched by column name against the Iceberg schema.
-fn inject_field_ids(
-    batch: RecordBatch,
-    schema: &IcebergSchema,
-) -> Result<RecordBatch> {
+fn inject_field_ids(batch: RecordBatch, schema: &IcebergSchema) -> Result<RecordBatch> {
     use arrow_schema::Field;
     use std::sync::Arc;
 
@@ -454,10 +459,12 @@ fn inject_field_ids(
             .fields()
             .iter()
             .find(|f| f.name == *arrow_field.name())
-            .with_context(|| format!(
-                "Column '{}' in query result has no matching field in Iceberg schema",
-                arrow_field.name()
-            ))?;
+            .with_context(|| {
+                format!(
+                    "Column '{}' in query result has no matching field in Iceberg schema",
+                    arrow_field.name()
+                )
+            })?;
 
         let mut meta = arrow_field.metadata().clone();
         meta.insert("PARQUET:field_id".to_string(), iceberg_field.id.to_string());
@@ -465,10 +472,8 @@ fn inject_field_ids(
         new_fields.push(arrow_field.as_ref().clone().with_metadata(meta));
     }
 
-    let new_schema = Arc::new(
-        ArrowSchema::new(new_fields)
-            .with_metadata(old_arrow.metadata().clone())
-    );
+    let new_schema =
+        Arc::new(ArrowSchema::new(new_fields).with_metadata(old_arrow.metadata().clone()));
 
     RecordBatch::try_new(new_schema, batch.columns().to_vec())
         .context("Rebuild RecordBatch with injected field IDs")
@@ -478,13 +483,13 @@ fn arrow_type_to_iceberg(dt: &arrow_schema::DataType) -> Type {
     use arrow_schema::DataType;
     match dt {
         DataType::Int8 | DataType::Int16 | DataType::Int32 => Type::Primitive(PrimitiveType::Int),
-        DataType::Int64  => Type::Primitive(PrimitiveType::Long),
+        DataType::Int64 => Type::Primitive(PrimitiveType::Long),
         DataType::Float32 => Type::Primitive(PrimitiveType::Float),
         DataType::Float64 => Type::Primitive(PrimitiveType::Double),
         DataType::Boolean => Type::Primitive(PrimitiveType::Boolean),
         DataType::Date32 | DataType::Date64 => Type::Primitive(PrimitiveType::Date),
         DataType::Timestamp(_, Some(_)) => Type::Primitive(PrimitiveType::Timestamptz),
-        DataType::Timestamp(_, None)    => Type::Primitive(PrimitiveType::Timestamp),
+        DataType::Timestamp(_, None) => Type::Primitive(PrimitiveType::Timestamp),
         _ => Type::Primitive(PrimitiveType::String),
     }
 }
@@ -492,7 +497,7 @@ fn arrow_type_to_iceberg(dt: &arrow_schema::DataType) -> Type {
 fn arrow_schema_to_iceberg(arrow: &ArrowSchema) -> Result<IcebergSchema> {
     let mut fields = Vec::new();
     for (idx, f) in arrow.fields().iter().enumerate() {
-        let field_id  = (idx + 1) as i32;
+        let field_id = (idx + 1) as i32;
         let iceberg_t = arrow_type_to_iceberg(f.data_type());
         fields.push(NestedField::optional(field_id, f.name(), iceberg_t).into());
     }
@@ -520,8 +525,8 @@ pub async fn run_jobs_parallel<C: Catalog + Sync>(
     retry_map: &HashMap<String, RetryConfig>,
     parallelism: usize,
 ) -> Vec<(String, Result<RunSummary>)> {
-    use tokio::sync::Semaphore;
     use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
     // Simple semaphore-based concurrency: honour topological order (the slice
     // is already sorted) and cap parallelism.

@@ -31,17 +31,20 @@
 //!       --table my_db.products \
 //!       --schema "id:long,name:string,price:double"
 
-
 mod config;
 mod sync;
 
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
-use arrow_array::{ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray,
+};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use clap::{Parser, Subcommand};
 use comfy_table::{Table, presets::UTF8_FULL};
+use config::SyncConfig;
 use futures::TryStreamExt;
 use iceberg::{
     Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent,
@@ -59,10 +62,7 @@ use iceberg::{
     writer::{
         IcebergWriter, IcebergWriterBuilder,
         base_writer::data_file_writer::DataFileWriterBuilder,
-        file_writer::{
-            ParquetWriterBuilder,
-            location_generator::DefaultLocationGenerator,
-        },
+        file_writer::{ParquetWriterBuilder, location_generator::DefaultLocationGenerator},
     },
 };
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
@@ -70,7 +70,6 @@ use iceberg_storage_opendal::OpenDalStorageFactory;
 use parquet::file::properties::WriterProperties;
 use sync::engine::SyncEngine;
 use sync::file_name::ProductionFileNameGenerator;
-use config::SyncConfig;
 
 // ─── CLI definition ──────────────────────────────────────────────────────────
 
@@ -172,7 +171,6 @@ enum Commands {
         namespace: String,
     },
 
-
     /// Run sync jobs from a YAML config file
     Sync {
         /// Path to sync config YAML
@@ -261,8 +259,22 @@ async fn main() -> Result<()> {
         Commands::CreateTable { table, schema } => {
             cmd_create_table(&catalog, table, schema).await?
         }
-        Commands::Sync { config, job, group, dry_run, parallel } => {
-            cmd_sync(&catalog, config, job.as_deref(), group.as_deref(), *dry_run, *parallel).await?
+        Commands::Sync {
+            config,
+            job,
+            group,
+            dry_run,
+            parallel,
+        } => {
+            cmd_sync(
+                &catalog,
+                config,
+                job.as_deref(),
+                group.as_deref(),
+                *dry_run,
+                *parallel,
+            )
+            .await?
         }
         Commands::SyncConsume { .. } => unreachable!(),
     }
@@ -787,12 +799,12 @@ fn json_rows_to_record_batch(rows: &[serde_json::Value], schema: &Schema) -> Res
                     .map(|r| {
                         r.get(col)
                             .and_then(|v| v.as_str())
-                            .and_then(|s| {
-                                chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
-                            })
+                            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
                             .map(|d| {
-                                d.signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
-                                    .num_days() as i32
+                                d.signed_duration_since(
+                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                                )
+                                .num_days() as i32
                             })
                     })
                     .collect();
@@ -815,11 +827,14 @@ fn json_rows_to_record_batch(rows: &[serde_json::Value], schema: &Schema) -> Res
                 // No timezone annotation — Iceberg PrimitiveType::Timestamp maps to
                 // Arrow Timestamp(µs) without tz.  Timestamptz would need "UTC" but
                 // the auto-create schema uses Timestamp, so keep them consistent.
-                arrow_fields.push(Field::new(
-                    col,
-                    DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
-                    true,
-                ).with_metadata(metadata));
+                arrow_fields.push(
+                    Field::new(
+                        col,
+                        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                        true,
+                    )
+                    .with_metadata(metadata),
+                );
                 columns.push(Arc::new(TimestampMicrosecondArray::from(vals)) as ArrayRef);
             }
             _ => {
@@ -843,13 +858,13 @@ fn json_rows_to_record_batch(rows: &[serde_json::Value], schema: &Schema) -> Res
 async fn cmd_sync(
     catalog: &impl Catalog,
     config_path: &str,
-    only_job:   Option<&str>,
+    only_job: Option<&str>,
     only_group: Option<&str>,
-    dry_run:    bool,
-    parallel:   usize,
+    dry_run: bool,
+    parallel: usize,
 ) -> Result<()> {
-    use sync::engine::run_jobs_parallel;
     use std::collections::HashMap;
+    use sync::engine::run_jobs_parallel;
 
     let cfg = SyncConfig::from_file(config_path)?;
     let engine = if dry_run {
@@ -860,8 +875,9 @@ async fn cmd_sync(
 
     // Build the ordered job list, applying filters.
     let all_jobs = cfg.ordered_jobs()?;
-    let jobs: Vec<_> = all_jobs.into_iter()
-        .filter(|j| only_job.map_or(true,   |n| j.name  == n))
+    let jobs: Vec<_> = all_jobs
+        .into_iter()
+        .filter(|j| only_job.map_or(true, |n| j.name == n))
         .filter(|j| only_group.map_or(true, |g| j.group.as_deref() == Some(g)))
         .collect();
 
@@ -875,10 +891,13 @@ async fn cmd_sync(
     }
 
     // Build DSN and retry maps for the parallel runner.
-    let source_dsn_map: HashMap<String, String> = cfg.sources.iter()
+    let source_dsn_map: HashMap<String, String> = cfg
+        .sources
+        .iter()
         .map(|(k, v)| (k.clone(), v.dsn.clone()))
         .collect();
-    let retry_map: HashMap<String, crate::config::RetryConfig> = jobs.iter()
+    let retry_map: HashMap<String, crate::config::RetryConfig> = jobs
+        .iter()
         .map(|j| (j.name.clone(), cfg.retry_for(j)))
         .collect();
 
@@ -909,7 +928,9 @@ async fn cmd_sync_consume(
     config_path: &str,
 ) -> Result<()> {
     let cfg = Arc::new(SyncConfig::from_file(config_path)?);
-    let rmq = cfg.rabbitmq.as_ref()
+    let rmq = cfg
+        .rabbitmq
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("No 'rabbitmq' section in config"))?;
 
     println!("Starting RabbitMQ consumer loop.  Press Ctrl-C to stop.");

@@ -32,11 +32,8 @@ use lapin::{
 };
 use tracing::{error, info, warn};
 
-use crate::config::{RabbitMqConfig, SyncConfig, QueueBinding};
-use crate::sync::{
-    engine::SyncEngine,
-    postgres::SqlValue,
-};
+use crate::config::{QueueBinding, RabbitMqConfig, SyncConfig};
+use crate::sync::{engine::SyncEngine, postgres::SqlValue};
 
 // ── Connection ────────────────────────────────────────────────────────────────
 
@@ -53,7 +50,7 @@ pub async fn connect(uri: &str) -> Result<Connection> {
 pub async fn run_consumers<C: Catalog + Send + Sync + 'static>(
     rmq_cfg: &RabbitMqConfig,
     sync_cfg: Arc<SyncConfig>,
-    catalog:  Arc<C>,
+    catalog: Arc<C>,
 ) -> Result<()> {
     let conn = connect(&rmq_cfg.uri).await?;
 
@@ -63,8 +60,8 @@ pub async fn run_consumers<C: Catalog + Send + Sync + 'static>(
         // Prefetch = 1 so a slow job doesn't starve other consumers.
         channel.basic_qos(1, BasicQosOptions::default()).await?;
 
-        let binding     = binding.clone();
-        let sync_cfg    = Arc::clone(&sync_cfg);
+        let binding = binding.clone();
+        let sync_cfg = Arc::clone(&sync_cfg);
         let catalog_ref = Arc::clone(&catalog);
 
         let handle = tokio::spawn(async move {
@@ -93,10 +90,12 @@ async fn consume_queue<C: Catalog>(
         .sync_jobs
         .iter()
         .find(|j| j.name == binding.job)
-        .with_context(|| format!(
-            "Queue '{}' binds to unknown job '{}'",
-            binding.queue, binding.job
-        ))?;
+        .with_context(|| {
+            format!(
+                "Queue '{}' binds to unknown job '{}'",
+                binding.queue, binding.job
+            )
+        })?;
 
     let source = sync_cfg
         .sources
@@ -120,11 +119,11 @@ async fn consume_queue<C: Catalog>(
         .queue_declare(
             &binding.queue,
             QueueDeclareOptions {
-                durable:   true,
-                passive:   false,
+                durable: true,
+                passive: false,
                 exclusive: false,
                 auto_delete: false,
-                nowait:    false,
+                nowait: false,
             },
             args,
         )
@@ -145,8 +144,11 @@ async fn consume_queue<C: Catalog>(
 
     while let Some(delivery) = consumer.next().await {
         let delivery = match delivery {
-            Ok(d)  => d,
-            Err(e) => { warn!("Delivery error: {e}"); continue; }
+            Ok(d) => d,
+            Err(e) => {
+                warn!("Delivery error: {e}");
+                continue;
+            }
         };
 
         let payload_result = parse_payload(&delivery.data);
@@ -155,13 +157,19 @@ async fn consume_queue<C: Catalog>(
             Err(e) => {
                 error!(queue = %binding.queue, "Bad payload: {e:#}");
                 delivery
-                    .nack(BasicNackOptions { requeue: false, multiple: false })
+                    .nack(BasicNackOptions {
+                        requeue: false,
+                        multiple: false,
+                    })
                     .await
                     .ok();
                 continue;
             }
             Ok(extra_params) => {
-                match engine.run_job(job, &source.dsn, Some(extra_params), &retry).await {
+                match engine
+                    .run_job(job, &source.dsn, Some(extra_params), &retry)
+                    .await
+                {
                     Ok(summary) => {
                         info!(
                             job   = %summary.job_name,
@@ -173,7 +181,10 @@ async fn consume_queue<C: Catalog>(
                     Err(e) => {
                         error!(job = %job.name, "Job error after retries: {e:#}");
                         delivery
-                            .nack(BasicNackOptions { requeue: false, multiple: false })
+                            .nack(BasicNackOptions {
+                                requeue: false,
+                                multiple: false,
+                            })
                             .await
                             .ok();
                     }
@@ -194,22 +205,20 @@ async fn consume_queue<C: Catalog>(
 /// ```
 /// → `{"user_id" => SqlValue::Int(42), "status" => SqlValue::Text("active")}`
 fn parse_payload(data: &[u8]) -> Result<HashMap<String, SqlValue>> {
-    let json: serde_json::Value = serde_json::from_slice(data)
-        .context("Payload is not valid JSON")?;
+    let json: serde_json::Value =
+        serde_json::from_slice(data).context("Payload is not valid JSON")?;
 
-    let obj = json
-        .as_object()
-        .context("Payload must be a JSON object")?;
+    let obj = json.as_object().context("Payload must be a JSON object")?;
 
     let mut params = HashMap::new();
     for (key, val) in obj {
         let sql_val = match val {
-            serde_json::Value::Bool(b)                             => SqlValue::Bool(*b),
-            serde_json::Value::Number(n) if n.is_i64()            => SqlValue::Int(n.as_i64().unwrap()),
-            serde_json::Value::Number(n)                          => SqlValue::Float(n.as_f64().unwrap_or(0.0)),
-            serde_json::Value::String(s)                          => SqlValue::Text(s.clone()),
-            serde_json::Value::Null                               => SqlValue::Null,
-            other                                                 => SqlValue::Text(other.to_string()),
+            serde_json::Value::Bool(b) => SqlValue::Bool(*b),
+            serde_json::Value::Number(n) if n.is_i64() => SqlValue::Int(n.as_i64().unwrap()),
+            serde_json::Value::Number(n) => SqlValue::Float(n.as_f64().unwrap_or(0.0)),
+            serde_json::Value::String(s) => SqlValue::Text(s.clone()),
+            serde_json::Value::Null => SqlValue::Null,
+            other => SqlValue::Text(other.to_string()),
         };
         params.insert(key.clone(), sql_val);
     }

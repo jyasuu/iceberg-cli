@@ -18,8 +18,8 @@
 
 use anyhow::{Context, Result};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
@@ -29,7 +29,8 @@ use tokio_postgres::{Client, NoTls, Row, types::Type};
 // ── Connection ────────────────────────────────────────────────────────────────
 
 pub async fn connect(dsn: &str) -> Result<Client> {
-    let (client, conn) = tokio_postgres::connect(dsn, NoTls).await
+    let (client, conn) = tokio_postgres::connect(dsn, NoTls)
+        .await
         .with_context(|| format!("Connect to Postgres: {dsn}"))?;
 
     tokio::spawn(async move {
@@ -49,8 +50,8 @@ pub fn bind_named_params(
     sql: &str,
     params: &HashMap<String, SqlValue>,
 ) -> Result<(String, Vec<SqlValue>)> {
-    let mut out_sql   = sql.to_string();
-    let mut ordered   = Vec::new();
+    let mut out_sql = sql.to_string();
+    let mut ordered = Vec::new();
     let mut name_to_idx: HashMap<String, usize> = HashMap::new();
 
     let mut remaining = sql;
@@ -118,8 +119,10 @@ pub async fn query_to_batch(
 
     let pg_params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
         ordered_vals.iter().map(sql_value_to_pg).collect();
-    let pg_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-        pg_params.iter().map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+    let pg_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
+        .iter()
+        .map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+        .collect();
 
     let rows = client
         .query(bound_sql.as_str(), pg_refs.as_slice())
@@ -135,12 +138,12 @@ pub async fn query_to_batch(
 
 fn sql_value_to_pg(v: &SqlValue) -> Box<dyn tokio_postgres::types::ToSql + Sync + Send> {
     match v {
-        SqlValue::Text(s)      => Box::new(s.clone()),
-        SqlValue::Int(i)       => Box::new(*i),
-        SqlValue::Float(f)     => Box::new(*f),
+        SqlValue::Text(s) => Box::new(s.clone()),
+        SqlValue::Int(i) => Box::new(*i),
+        SqlValue::Float(f) => Box::new(*f),
         SqlValue::Timestamp(t) => Box::new(*t),
-        SqlValue::Bool(b)      => Box::new(*b),
-        SqlValue::Null         => Box::new(Option::<String>::None),
+        SqlValue::Bool(b) => Box::new(*b),
+        SqlValue::Null => Box::new(Option::<String>::None),
     }
 }
 
@@ -151,12 +154,12 @@ fn rows_to_batch(rows: &[Row]) -> Result<Option<RecordBatch>> {
         return Ok(None);
     }
 
-    let stmt    = rows[0].columns();
-    let mut fields:  Vec<Field>    = Vec::with_capacity(stmt.len());
+    let stmt = rows[0].columns();
+    let mut fields: Vec<Field> = Vec::with_capacity(stmt.len());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(stmt.len());
 
     for (col_idx, col) in stmt.iter().enumerate() {
-        let name    = col.name().to_string();
+        let name = col.name().to_string();
         let pg_type = col.type_();
 
         match pg_type {
@@ -277,20 +280,26 @@ fn rows_to_batch(rows: &[Row]) -> Result<Option<RecordBatch>> {
     }
 
     let schema = Arc::new(ArrowSchema::new(fields));
-    let batch  = RecordBatch::try_new(schema, columns)
-        .context("Build RecordBatch from Postgres rows")?;
+    let batch =
+        RecordBatch::try_new(schema, columns).context("Build RecordBatch from Postgres rows")?;
     Ok(Some(batch))
 }
 
 /// Extract the maximum value of a timestamp column from a batch.
 /// Used to advance the watermark after a successful write.
 pub fn max_timestamp_in_batch(batch: &RecordBatch, column: &str) -> Option<DateTime<Utc>> {
-    let idx    = batch.schema().index_of(column).ok()?;
-    let array  = batch.column(idx);
+    let idx = batch.schema().index_of(column).ok()?;
+    let array = batch.column(idx);
     let ts_arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>()?;
 
     let max_us = (0..ts_arr.len())
-        .filter_map(|i| if ts_arr.is_null(i) { None } else { Some(ts_arr.value(i)) })
+        .filter_map(|i| {
+            if ts_arr.is_null(i) {
+                None
+            } else {
+                Some(ts_arr.value(i))
+            }
+        })
         .max()?;
 
     DateTime::from_timestamp_micros(max_us)
@@ -299,17 +308,29 @@ pub fn max_timestamp_in_batch(batch: &RecordBatch, column: &str) -> Option<DateT
 /// Extract the last (maximum) Int64 or Int32 value from a column.
 /// Used for cursor-based pagination advancement.
 pub fn max_int_in_batch(batch: &RecordBatch, column: &str) -> Option<i64> {
-    let idx   = batch.schema().index_of(column).ok()?;
+    let idx = batch.schema().index_of(column).ok()?;
     let array = batch.column(idx);
 
     if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
         return (0..arr.len())
-            .filter_map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
+            .filter_map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i))
+                }
+            })
             .max();
     }
     if let Some(arr) = array.as_any().downcast_ref::<Int32Array>() {
         return (0..arr.len())
-            .filter_map(|i| if arr.is_null(i) { None } else { Some(arr.value(i) as i64) })
+            .filter_map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i) as i64)
+                }
+            })
             .max();
     }
     None
