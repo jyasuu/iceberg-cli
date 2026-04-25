@@ -1,7 +1,13 @@
 # sync.example.yaml
 #
-# Illustrates a full SAP-like MM module sync with two related tables
-# and a RabbitMQ-triggered user lookup.
+# Demonstrates all new features:
+#   - cursor-based pagination (cursor_column)
+#   - batch atomicity with retry
+#   - N+1-safe multi-table joins
+#   - schema evolution
+#   - job groups
+#   - RabbitMQ with dead-letter exchange
+#   - full vs incremental modes
 #
 # Run all jobs:
 #   iceberg-cli --uri http://localhost:8181 --s3-endpoint http://localhost:9000 \
@@ -9,6 +15,15 @@
 #
 # Run one job:
 #   iceberg-cli ... sync --config sync.example.yaml --job orders
+#
+# Run a group:
+#   iceberg-cli ... sync --config sync.example.yaml --group orders_pipeline
+#
+# Dry-run (no writes):
+#   iceberg-cli ... sync --config sync.example.yaml --dry-run
+#
+# Run with parallelism:
+#   iceberg-cli ... sync --config sync.example.yaml --parallel 4
 #
 # RabbitMQ consumer (blocks):
 #   iceberg-cli ... sync-consume --config sync.example.yaml
@@ -28,15 +43,24 @@ destinations:
     access_key_id:     minioadmin
     secret_access_key: minioadmin
 
+# ── Global retry policy ───────────────────────────────────────────────────────
+retry:
+  max_attempts: 3          # 1 initial + 2 retries
+  initial_delay_ms: 500    # wait 500 ms before first retry
+  backoff_multiplier: 2.0  # 500 → 1000 → 2000 ms
+
 # ── Sync jobs ─────────────────────────────────────────────────────────────────
 sync_jobs:
 
-  # 1. Parent table: orders (incremental, watermark on created_at)
-  - name:       orders
+  # 1. Parent table: orders (incremental + cursor pagination)
+  #    cursor_column avoids OFFSET drift — uses WHERE id > :_cursor instead.
+  #    watermark_column tracks the high-water mark across runs.
+  - name:        orders
     source:      main_pg
     destination: warehouse
     namespace:   shop
     table:       orders
+    group:       orders_pipeline
     sql: |
       SELECT
         o.id,
@@ -47,18 +71,23 @@ sync_jobs:
         o.updated_at
       FROM orders o
       WHERE o.updated_at > :watermark
-      ORDER BY o.updated_at ASC
+      ORDER BY o.updated_at ASC, o.id ASC
     watermark_column: updated_at
+    cursor_column:    id        # stable PK — enables cursor pagination
     batch_size: 500
     mode: incremental
+    schema_evolution:
+      allow_add_columns: true  # new columns in source auto-appended to Iceberg table
 
-  # 2. Child table: order_items (N+1-safe JOIN, driven off parent watermark)
-  #    depends_on ensures orders are committed first.
-  - name:       order_items
+  # 2. Child table: order_items
+  #    N+1-safe: single JOIN query, no per-row lookups.
+  #    depends_on ensures orders are committed before items are synced.
+  - name:        order_items
     source:      main_pg
     destination: warehouse
     namespace:   shop
     table:       order_items
+    group:       orders_pipeline
     sql: |
       SELECT
         oi.id,
@@ -67,22 +96,24 @@ sync_jobs:
         oi.quantity,
         oi.unit_price,
         oi.line_total,
-        o.updated_at AS order_updated_at
+        o.updated_at  AS order_updated_at
       FROM order_items oi
       INNER JOIN orders o ON o.id = oi.order_id
       WHERE o.updated_at > :watermark
       ORDER BY o.updated_at ASC, oi.id ASC
     watermark_column: order_updated_at
-    depends_on: orders         # topological ordering: run after orders
+    cursor_column:    id
+    depends_on: orders   # topological: run only after orders commits
     batch_size: 1000
     mode: incremental
 
-  # 3. Slow-changing dimension: full reload every run
-  - name:       products
+  # 3. Slow-changing dimension: full reload each run, no watermark
+  - name:        products
     source:      main_pg
     destination: warehouse
     namespace:   shop
     table:       products
+    group:       dimensions
     sql: |
       SELECT
         p.id,
@@ -90,16 +121,21 @@ sync_jobs:
         p.name,
         p.category,
         p.unit_price,
-        p.stock_qty
+        p.stock_qty,
+        p.active       -- boolean column (auto-mapped to Arrow Boolean)
       FROM products p
       ORDER BY p.id
-    watermark_column: ~         # no watermark for full mode
+    watermark_column: ~    # no watermark; full reload
     batch_size: 2000
     mode: full
+    retry:
+      max_attempts: 5       # override global retry for this job
+      initial_delay_ms: 1000
+      backoff_multiplier: 1.5
 
-  # 4. RabbitMQ-parameterised job: look up a single user's orders
+  # 4. RabbitMQ-parameterised: user-scoped order snapshot
   #    Payload: {"user_id": 42}  → :user_id substituted in SQL
-  - name:       user_orders_on_demand
+  - name:        user_orders_on_demand
     source:      main_pg
     destination: warehouse
     namespace:   shop
@@ -116,12 +152,39 @@ sync_jobs:
       ORDER BY o.created_at DESC
     watermark_column: ~
     batch_size: 200
-    mode: full                  # re-snapshot for this user every trigger
+    mode: full
 
-# ── RabbitMQ (optional) ───────────────────────────────────────────────────────
+  # 5. Custom SQL for a production ops query — audit log tail
+  #    Uses cursor pagination on a UUID-keyed log table.
+  #    UUID columns are stringified automatically.
+  - name:        audit_log
+    source:      main_pg
+    destination: warehouse
+    namespace:   ops
+    table:       audit_log
+    group:       ops_pipeline
+    sql: |
+      SELECT
+        al.id::text   AS id,    -- UUID → text
+        al.actor_id,
+        al.action,
+        al.resource,
+        al.payload::text AS payload,   -- JSONB → text
+        al.created_at
+      FROM audit_log al
+      WHERE al.created_at > :watermark
+      ORDER BY al.created_at ASC, al.id ASC
+    watermark_column: created_at
+    batch_size: 1000
+    mode: incremental
+    schema_evolution:
+      allow_add_columns: true
+
+# ── RabbitMQ ──────────────────────────────────────────────────────────────────
 rabbitmq:
   uri: "amqp://guest:guest@localhost:5672/%2f"
   queues:
-    - queue: user_sync_requests
-      job:   user_orders_on_demand
-      # Message example: {"user_id": 42}
+    - queue:                user_sync_requests
+      job:                  user_orders_on_demand
+      dead_letter_exchange: dlx.sync   # nacked messages → dead-letter exchange
+      # Message format: {"user_id": 42}

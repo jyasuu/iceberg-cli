@@ -6,12 +6,16 @@
 //!   Queue message: `{"user_id": 42}`
 //!   Job SQL:       `SELECT … WHERE user_id = :user_id`
 //!
-//! The consumer:
-//!   1. Reads one message at a time (manual ack).
-//!   2. Parses the payload into `HashMap<String, SqlValue>`.
-//!   3. Delegates to `SyncEngine::run_job`.
-//!   4. Acks on success, nacks (with requeue=false) on error so the message
-//!      is dead-lettered rather than looping infinitely.
+//! ## New features
+//!
+//! ### Dead-letter exchange (DLX)
+//! When `dead_letter_exchange` is set in the queue binding the consumer
+//! declares the queue with `x-dead-letter-exchange` so nacked messages are
+//! routed to the DLX instead of being dropped.
+//!
+//! ### Per-job retry
+//! Failed jobs are retried according to the effective `RetryConfig` before
+//! being nacked.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -20,8 +24,11 @@ use futures::StreamExt;
 use iceberg::Catalog;
 use lapin::{
     Channel, Connection, ConnectionProperties,
-    options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions},
-    types::FieldTable,
+    options::{
+        BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions,
+        QueueDeclareOptions,
+    },
+    types::{AMQPValue, FieldTable},
 };
 use tracing::{error, info, warn};
 
@@ -42,7 +49,7 @@ pub async fn connect(uri: &str) -> Result<Connection> {
 // ── Consumer loop ─────────────────────────────────────────────────────────────
 
 /// Start one consumer per queue binding and drive them concurrently.
-/// Blocks until all consumers exit (i.e. until the connection is closed).
+/// Blocks until all consumers exit.
 pub async fn run_consumers<C: Catalog + Send + Sync + 'static>(
     rmq_cfg: &RabbitMqConfig,
     sync_cfg: Arc<SyncConfig>,
@@ -82,7 +89,6 @@ async fn consume_queue<C: Catalog>(
     sync_cfg: &SyncConfig,
     catalog: &C,
 ) -> Result<()> {
-    // Look up the job definition.
     let job = sync_cfg
         .sync_jobs
         .iter()
@@ -97,7 +103,33 @@ async fn consume_queue<C: Catalog>(
         .get(&job.source)
         .with_context(|| format!("Source '{}' not found", job.source))?;
 
+    let retry = sync_cfg.retry_for(job);
     let engine = SyncEngine::new(catalog);
+
+    // Declare queue with optional dead-letter exchange.
+    let mut args = FieldTable::default();
+    if let Some(dlx) = &binding.dead_letter_exchange {
+        args.insert(
+            "x-dead-letter-exchange".into(),
+            AMQPValue::LongString(dlx.clone().into()),
+        );
+        info!(queue = %binding.queue, dlx = %dlx, "Declared queue with dead-letter exchange");
+    }
+
+    channel
+        .queue_declare(
+            &binding.queue,
+            QueueDeclareOptions {
+                durable:   true,
+                passive:   false,
+                exclusive: false,
+                auto_delete: false,
+                nowait:    false,
+            },
+            args,
+        )
+        .await
+        .with_context(|| format!("Declare queue '{}'", binding.queue))?;
 
     let mut consumer = channel
         .basic_consume(
@@ -129,7 +161,7 @@ async fn consume_queue<C: Catalog>(
                 continue;
             }
             Ok(extra_params) => {
-                match engine.run_job(job, &source.dsn, Some(extra_params)).await {
+                match engine.run_job(job, &source.dsn, Some(extra_params), &retry).await {
                     Ok(summary) => {
                         info!(
                             job   = %summary.job_name,
@@ -139,7 +171,7 @@ async fn consume_queue<C: Catalog>(
                         delivery.ack(BasicAckOptions::default()).await.ok();
                     }
                     Err(e) => {
-                        error!(job = %job.name, "Job error: {e:#}");
+                        error!(job = %job.name, "Job error after retries: {e:#}");
                         delivery
                             .nack(BasicNackOptions { requeue: false, multiple: false })
                             .await
@@ -172,11 +204,12 @@ fn parse_payload(data: &[u8]) -> Result<HashMap<String, SqlValue>> {
     let mut params = HashMap::new();
     for (key, val) in obj {
         let sql_val = match val {
-            serde_json::Value::Number(n) if n.is_i64() => SqlValue::Int(n.as_i64().unwrap()),
-            serde_json::Value::Number(n)               => SqlValue::Float(n.as_f64().unwrap_or(0.0)),
-            serde_json::Value::String(s)               => SqlValue::Text(s.clone()),
-            serde_json::Value::Null                    => SqlValue::Null,
-            other                                      => SqlValue::Text(other.to_string()),
+            serde_json::Value::Bool(b)                             => SqlValue::Bool(*b),
+            serde_json::Value::Number(n) if n.is_i64()            => SqlValue::Int(n.as_i64().unwrap()),
+            serde_json::Value::Number(n)                          => SqlValue::Float(n.as_f64().unwrap_or(0.0)),
+            serde_json::Value::String(s)                          => SqlValue::Text(s.clone()),
+            serde_json::Value::Null                               => SqlValue::Null,
+            other                                                 => SqlValue::Text(other.to_string()),
         };
         params.insert(key.clone(), sql_val);
     }

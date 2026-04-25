@@ -1,59 +1,47 @@
 //! Sync configuration — loaded from a YAML file.
 //!
-//! Example config:
-//! ```yaml
-//! sources:
-//!   main_pg:
-//!     type: postgres
-//!     dsn: "host=localhost port=5432 dbname=shop user=app password=secret"
+//! ## New features
 //!
-//! destinations:
-//!   warehouse:
-//!     catalog_uri: "http://localhost:8181"
-//!     s3_endpoint:  "http://localhost:9000"
-//!     region:       "us-east-1"
-//!     access_key_id: minioadmin
-//!     secret_access_key: minioadmin
+//! ### Cursor-based pagination (`cursor_column`)
+//! Instead of LIMIT/OFFSET (which drifts when rows are inserted mid-run), the
+//! engine wraps the caller's SQL as:
 //!
-//! sync_jobs:
-//!   - name: orders
-//!     source: main_pg
-//!     destination: warehouse
-//!     namespace: shop
-//!     table: orders
-//!     # Full-table SQL (incremental mode uses the watermark column automatically)
-//!     sql: |
-//!       SELECT o.id, o.user_id, o.total, o.created_at
-//!       FROM   orders o
-//!       WHERE  o.created_at > :watermark
-//!       ORDER  BY o.created_at
-//!     watermark_column: created_at
-//!     batch_size: 500
-//!     mode: incremental          # incremental | full
-//!
-//!   - name: order_items
-//!     source: main_pg
-//!     destination: warehouse
-//!     namespace: shop
-//!     table: order_items
-//!     # N+1-safe: join pulled into SQL
-//!     sql: |
-//!       SELECT oi.id, oi.order_id, oi.product_id, oi.qty, oi.unit_price
-//!       FROM   order_items oi
-//!       JOIN   orders      o  ON o.id = oi.order_id
-//!       WHERE  o.created_at > :watermark
-//!     watermark_column: ~         # no direct watermark; driven by parent job
-//!     depends_on: orders          # run after parent
-//!     batch_size: 1000
-//!     mode: incremental
-//!
-//! rabbitmq:
-//!   uri: "amqp://guest:guest@localhost:5672/%2f"
-//!   queues:
-//!     - queue: user_sync_requests
-//!       job: users_by_id
-//!       # payload {"user_id": 42} → SELECT … WHERE user_id = :user_id
+//! ```sql
+//! SELECT * FROM (<user_sql>) _q
+//! WHERE <cursor_column> > :_cursor
+//! ORDER BY <cursor_column>
+//! LIMIT <batch_size>
 //! ```
+//!
+//! The cursor is advanced in memory each batch; the watermark handles
+//! across-run resumption.
+//!
+//! ### Retry config (`retry`)
+//! Global or per-job exponential-backoff retry:
+//! ```yaml
+//! retry:
+//!   max_attempts: 3
+//!   initial_delay_ms: 500
+//!   backoff_multiplier: 2.0
+//! ```
+//!
+//! ### Schema evolution (`schema_evolution`)
+//! With `allow_add_columns: true`, new columns in the source are appended to
+//! the Iceberg table automatically.
+//!
+//! ### Dry-run (`--dry-run` CLI flag)
+//! Logs what the engine *would* do without writing any data.
+//!
+//! ### Parallel execution (`parallel`)
+//! Independent jobs (no shared dependency chain) run concurrently up to
+//! `parallel` workers (default 1).
+//!
+//! ### Dead-letter queue (`dead_letter_exchange`)
+//! RabbitMQ bindings can specify a DLX for nacked messages.
+//!
+//! ### Job groups (`group`)
+//! Tag jobs with a group name to run just that cohort:
+//! `iceberg-cli sync --group orders_pipeline`
 
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
@@ -65,6 +53,9 @@ pub struct SyncConfig {
     pub sources:      HashMap<String, SourceConfig>,
     pub destinations: HashMap<String, DestinationConfig>,
     pub sync_jobs:    Vec<SyncJob>,
+    /// Global retry policy — can be overridden per job.
+    #[serde(default)]
+    pub retry:        RetryConfig,
     #[serde(default)]
     pub rabbitmq:     Option<RabbitMqConfig>,
 }
@@ -98,24 +89,62 @@ impl SyncConfig {
                     job.name, dep
                 );
             }
+            if job.cursor_column.is_some() && job.mode == SyncMode::Full {
+                anyhow::bail!(
+                    "Job '{}': cursor_column cannot be used with mode: full",
+                    job.name
+                );
+            }
+        }
+        self.detect_cycles()?;
+        Ok(())
+    }
+
+    fn detect_cycles(&self) -> anyhow::Result<()> {
+        use std::collections::HashSet;
+        let mut visiting: HashSet<&str> = HashSet::new();
+        let mut visited:  HashSet<&str> = HashSet::new();
+
+        fn dfs<'a>(
+            name: &'a str,
+            jobs: &'a [SyncJob],
+            visiting: &mut HashSet<&'a str>,
+            visited:  &mut HashSet<&'a str>,
+        ) -> anyhow::Result<()> {
+            if visited.contains(name) { return Ok(()); }
+            anyhow::ensure!(
+                !visiting.contains(name),
+                "Dependency cycle detected involving job '{}'", name
+            );
+            visiting.insert(name);
+            if let Some(job) = jobs.iter().find(|j| j.name == name) {
+                if let Some(dep) = &job.depends_on {
+                    dfs(dep, jobs, visiting, visited)?;
+                }
+            }
+            visiting.remove(name);
+            visited.insert(name);
+            Ok(())
+        }
+
+        for name in self.sync_jobs.iter().map(|j| j.name.as_str()) {
+            dfs(name, &self.sync_jobs, &mut visiting, &mut visited)?;
         }
         Ok(())
     }
 
-    /// Returns jobs sorted so dependencies run before dependents (topological).
+    /// Jobs sorted so dependencies run before dependents (topological).
     pub fn ordered_jobs(&self) -> anyhow::Result<Vec<&SyncJob>> {
-        let mut result: Vec<&SyncJob> = Vec::new();
-        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut result:  Vec<&SyncJob> = Vec::new();
+        let mut visited: std::collections::HashSet<&str> = Default::default();
 
         fn visit<'a>(
-            name: &'a str,
-            jobs: &'a [SyncJob],
+            name:    &'a str,
+            jobs:    &'a [SyncJob],
             visited: &mut std::collections::HashSet<&'a str>,
-            result: &mut Vec<&'a SyncJob>,
+            result:  &mut Vec<&'a SyncJob>,
         ) -> anyhow::Result<()> {
-            if visited.contains(name) {
-                return Ok(());
-            }
+            if visited.contains(name) { return Ok(()); }
             let job = jobs.iter().find(|j| j.name == name)
                 .ok_or_else(|| anyhow::anyhow!("Job '{}' not found", name))?;
             if let Some(dep) = &job.depends_on {
@@ -126,11 +155,21 @@ impl SyncConfig {
             Ok(())
         }
 
-        let names: Vec<&str> = self.sync_jobs.iter().map(|j| j.name.as_str()).collect();
-        for name in names {
+        for name in self.sync_jobs.iter().map(|j| j.name.as_str()) {
             visit(name, &self.sync_jobs, &mut visited, &mut result)?;
         }
         Ok(result)
+    }
+
+    /// Jobs filtered by group name, topologically ordered.
+    pub fn ordered_jobs_for_group<'a>(&'a self, group: &str) -> anyhow::Result<Vec<&'a SyncJob>> {
+        let all = self.ordered_jobs()?;
+        Ok(all.into_iter().filter(|j| j.group.as_deref() == Some(group)).collect())
+    }
+
+    /// Effective retry policy for a job (job-level overrides global).
+    pub fn retry_for(&self, job: &SyncJob) -> RetryConfig {
+        job.retry.clone().unwrap_or_else(|| self.retry.clone())
     }
 }
 
@@ -167,6 +206,45 @@ pub struct DestinationConfig {
 fn default_region()       -> String { "us-east-1".to_string() }
 fn default_catalog_name() -> String { "default".to_string() }
 
+// ── Retry policy ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RetryConfig {
+    /// Total attempts including the first (1 = no retry).
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    /// Delay before first retry in milliseconds.
+    #[serde(default = "default_initial_delay_ms")]
+    pub initial_delay_ms: u64,
+    /// Backoff multiplier applied after each failure (1.0 = constant delay).
+    #[serde(default = "default_backoff_multiplier")]
+    pub backoff_multiplier: f64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts:       default_max_attempts(),
+            initial_delay_ms:   default_initial_delay_ms(),
+            backoff_multiplier: default_backoff_multiplier(),
+        }
+    }
+}
+
+fn default_max_attempts()       -> u32 { 3 }
+fn default_initial_delay_ms()   -> u64 { 500 }
+fn default_backoff_multiplier() -> f64 { 2.0 }
+
+// ── Schema evolution ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SchemaEvolutionConfig {
+    /// When true, columns present in the source but absent from the Iceberg
+    /// table are appended automatically.  Removed columns are left nullable.
+    #[serde(default)]
+    pub allow_add_columns: bool,
+}
+
 // ── Sync job ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -177,14 +255,31 @@ pub struct SyncJob {
     pub namespace:   String,
     pub table:       String,
 
-    /// Custom SQL for the query. Use `:watermark` as the placeholder for
-    /// incremental mode and `:param_name` for RabbitMQ-driven queries.
+    /// Optional group tag — run cohorts with `--group <name>`.
+    pub group: Option<String>,
+
+    /// Custom SQL with named placeholders:
+    /// - `:watermark`  — last committed watermark (incremental)
+    /// - `:_cursor`    — injected by engine when `cursor_column` is set
+    /// - `:param_name` — any key from a RabbitMQ payload
     pub sql: String,
 
-    /// Column used to track incremental progress (e.g. `updated_at`).
+    /// Watermark column for incremental tracking (e.g. `updated_at`).
     pub watermark_column: Option<String>,
 
-    /// Run this job only after the named job has committed.
+    /// Stable, monotonically increasing column for cursor-based pagination
+    /// (e.g. primary key `id`).  Avoids LIMIT/OFFSET drift.
+    ///
+    /// When set the engine wraps the SQL as:
+    /// ```sql
+    /// SELECT * FROM (<user_sql>) _q
+    /// WHERE <cursor_column> > :_cursor
+    /// ORDER BY <cursor_column>
+    /// LIMIT <batch_size>
+    /// ```
+    pub cursor_column: Option<String>,
+
+    /// Run only after the named job has committed successfully.
     pub depends_on: Option<String>,
 
     #[serde(default = "default_batch_size")]
@@ -192,6 +287,12 @@ pub struct SyncJob {
 
     #[serde(default)]
     pub mode: SyncMode,
+
+    #[serde(default)]
+    pub schema_evolution: SchemaEvolutionConfig,
+
+    /// Per-job retry override.
+    pub retry: Option<RetryConfig>,
 }
 
 fn default_batch_size() -> usize { 500 }
@@ -199,10 +300,8 @@ fn default_batch_size() -> usize { 500 }
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SyncMode {
-    /// Only fetch rows newer than the last watermark.
     #[default]
     Incremental,
-    /// Truncate and reload the full table every run.
     Full,
 }
 
@@ -214,11 +313,10 @@ pub struct RabbitMqConfig {
     pub queues: Vec<QueueBinding>,
 }
 
-/// Maps a RabbitMQ queue to a sync job.
-/// The message payload (JSON object) is merged with the SQL parameters —
-/// e.g. `{"user_id": 42}` fills `:user_id` in the job's SQL.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct QueueBinding {
     pub queue: String,
     pub job:   String,
+    /// Dead-letter exchange for nacked messages.
+    pub dead_letter_exchange: Option<String>,
 }

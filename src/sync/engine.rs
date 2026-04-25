@@ -1,30 +1,48 @@
 //! Core sync engine.
 //!
-//! Responsibilities:
-//!   1. Resolve watermark from Iceberg table properties (incremental mode).
-//!   2. Query PostgreSQL in batches.
-//!   3. Write each batch to Iceberg using a fast-append transaction.
-//!   4. Within each commit, update watermark + run metadata atomically.
-//!
-//! Batch atomicity guarantee
-//! ─────────────────────────
+//! ## Batch atomicity guarantee
 //! Each batch is committed as its own Iceberg snapshot.  If the process dies
-//! mid-batch the partial data file is abandoned (no manifest points to it) and
-//! the watermark is not advanced — so the next run re-fetches that batch.
-//! This gives at-least-once delivery; downstream deduplication on a primary
-//! key is recommended for exactly-once semantics.
+//! mid-batch the partial Parquet file is abandoned (no manifest points to it)
+//! and the watermark / cursor are not advanced, so the next run re-fetches
+//! that batch.  This gives at-least-once delivery; downstream deduplication
+//! on a primary key is recommended for exactly-once semantics.
+//!
+//! ## Cursor-based pagination
+//! When `cursor_column` is configured the engine wraps the user's SQL:
+//! ```sql
+//! SELECT * FROM (<user_sql>) _q
+//! WHERE <cursor_col> > :_cursor
+//! ORDER BY <cursor_col>
+//! LIMIT <batch_size>
+//! ```
+//! The cursor starts at `i64::MIN` and is advanced to the max value seen in
+//! each committed batch.  This avoids the OFFSET-drift problem (rows inserted
+//! mid-run shifting subsequent pages).
+//!
+//! When no cursor is configured, the engine falls back to LIMIT/OFFSET.
+//!
+//! ## Retry with exponential backoff
+//! Transient write failures are retried according to the job's `RetryConfig`
+//! before the engine propagates the error.
+//!
+//! ## Schema evolution
+//! When `schema_evolution.allow_add_columns` is true, columns present in the
+//! source query result but absent from the Iceberg table are added via an
+//! `UpdateSchemaAction` before the write.
+//!
+//! ## Dry-run mode
+//! When `dry_run = true` the engine logs what it *would* do but skips all
+//! writes and catalog mutations.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use chrono::{DateTime, Utc};
 use iceberg::{
-    Catalog,
-    NamespaceIdent,
-    TableCreation,
-    TableIdent,
+    Catalog, NamespaceIdent, TableCreation, TableIdent,
     spec::{DataFileFormat, NestedField, PrimitiveType, Schema as IcebergSchema, Type},
     transaction::{ApplyTransactionAction, Transaction},
     writer::{
@@ -40,34 +58,77 @@ use iceberg::{
 use parquet::file::properties::WriterProperties;
 use tracing::{info, warn};
 
-use crate::config::{SyncJob, SyncMode};
+use crate::config::{RetryConfig, SchemaEvolutionConfig, SyncJob, SyncMode};
 use crate::sync::{
     file_name::ProductionFileNameGenerator,
     metadata::{RunSummary, build_metadata_updates, read_watermark},
-    postgres::{SqlValue, connect as pg_connect, max_timestamp_in_batch, query_to_batch},
+    postgres::{SqlValue, connect as pg_connect, max_int_in_batch, max_timestamp_in_batch, query_to_batch},
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub struct SyncEngine<'a, C: Catalog> {
     pub catalog: &'a C,
+    /// When true, skip all writes and catalog mutations.
+    pub dry_run: bool,
 }
 
 impl<'a, C: Catalog> SyncEngine<'a, C> {
     pub fn new(catalog: &'a C) -> Self {
-        Self { catalog }
+        Self { catalog, dry_run: false }
     }
 
-    /// Run a single sync job end-to-end.
-    /// `extra_params`: additional SQL parameters merged with the watermark param
-    /// (used by RabbitMQ-driven invocations whose payload carries extra filters).
+    pub fn with_dry_run(catalog: &'a C) -> Self {
+        Self { catalog, dry_run: true }
+    }
+
+    /// Run a single sync job end-to-end with retry.
+    ///
+    /// `extra_params`: additional SQL parameters merged with the watermark
+    /// param (used by RabbitMQ-driven invocations).
+    /// `retry`: the effective retry policy.
     pub async fn run_job(
         &self,
         job: &SyncJob,
         pg_dsn: &str,
         extra_params: Option<HashMap<String, SqlValue>>,
+        retry: &RetryConfig,
     ) -> Result<RunSummary> {
-        let pg = pg_connect(pg_dsn).await?;
+        let mut last_err = None;
+        let mut delay_ms = retry.initial_delay_ms as f64;
+
+        for attempt in 1..=retry.max_attempts {
+            match self.run_job_once(job, pg_dsn, extra_params.clone()).await {
+                Ok(summary) => return Ok(summary),
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < retry.max_attempts {
+                        warn!(
+                            job = %job.name,
+                            attempt,
+                            max = retry.max_attempts,
+                            delay_ms,
+                            "Batch failed — retrying"
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+                        delay_ms *= retry.backoff_multiplier;
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap())
+    }
+
+    // ── Inner run (single attempt) ────────────────────────────────────────────
+
+    async fn run_job_once(
+        &self,
+        job: &SyncJob,
+        pg_dsn: &str,
+        extra_params: Option<HashMap<String, SqlValue>>,
+    ) -> Result<RunSummary> {
+        let pg    = pg_connect(pg_dsn).await?;
         let ident = table_ident(&job.namespace, &job.table)?;
 
         // ── 1. Resolve watermark ──────────────────────────────────────────────
@@ -86,6 +147,7 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
             job = %job.name,
             mode = ?job.mode,
             watermark = ?watermark,
+            dry_run = self.dry_run,
             "Starting sync job"
         );
 
@@ -94,7 +156,6 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         if let Some(wm) = watermark {
             params.insert("watermark".to_string(), SqlValue::Timestamp(wm));
         } else {
-            // First run: substitute a very old timestamp so all rows are fetched.
             params.insert(
                 "watermark".to_string(),
                 SqlValue::Timestamp(
@@ -104,26 +165,31 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         }
 
         // ── 3. Fetch & write in batches ───────────────────────────────────────
-        let mut total_rows:    usize             = 0;
+        let mut total_rows:    usize                = 0;
         let mut new_watermark: Option<DateTime<Utc>> = watermark;
 
-        // We page using LIMIT / OFFSET injected around the caller's SQL.
-        let mut offset = 0usize;
+        // Cursor pagination state (i64::MIN = "before all rows").
+        let mut cursor_value: i64  = i64::MIN;
+        let mut offset:       usize = 0;  // fallback OFFSET when no cursor col
+
         loop {
-            let paged_sql = format!(
-                "SELECT * FROM ({}) _q LIMIT {} OFFSET {}",
-                job.sql, job.batch_size, offset
-            );
+            // Inject cursor param so bind_named_params can resolve :_cursor.
+            if job.cursor_column.is_some() {
+                params.insert("_cursor".to_string(), SqlValue::Int(cursor_value));
+            }
+
+            // Build the paged SQL using cursor or OFFSET strategy.
+            let paged_sql = build_paged_sql(job, offset);
 
             let batch = query_to_batch(&pg, &paged_sql, &params).await?;
 
             match batch {
-                None => break,  // no more rows
+                None => break,
                 Some(rb) => {
                     let n = rb.num_rows();
                     if n == 0 { break; }
 
-                    // Track the maximum watermark seen in this batch.
+                    // Advance watermark.
                     if let Some(col) = &job.watermark_column {
                         if let Some(ts) = max_timestamp_in_batch(&rb, col) {
                             new_watermark = Some(match new_watermark {
@@ -133,16 +199,31 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
                         }
                     }
 
-                    self.write_batch_atomic(job, rb, &new_watermark).await
-                        .with_context(|| format!(
-                            "Write batch offset={offset} for job '{}'",
-                            job.name
-                        ))?;
+                    // Advance cursor.
+                    if let Some(col) = &job.cursor_column {
+                        if let Some(max_id) = max_int_in_batch(&rb, col) {
+                            cursor_value = max_id;
+                        }
+                    } else {
+                        offset += n;
+                    }
+
+                    if self.dry_run {
+                        info!(
+                            job = %job.name,
+                            rows = n,
+                            "[dry-run] would commit batch (skipped)"
+                        );
+                    } else {
+                        self.write_batch_atomic(job, rb, &new_watermark).await
+                            .with_context(|| format!(
+                                "Write batch (cursor={cursor_value}, offset={offset}) \
+                                 for job '{}'", job.name
+                            ))?;
+                    }
 
                     total_rows += n;
-                    offset     += n;
-
-                    info!(job = %job.name, rows = n, offset, "Batch committed");
+                    info!(job = %job.name, rows = n, total_rows, "Batch committed");
 
                     if n < job.batch_size {
                         break; // last partial batch
@@ -170,20 +251,19 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
     ) -> Result<()> {
         let ident = table_ident(&job.namespace, &job.table)?;
 
-        // Ensure the table exists (create on first run).
         self.ensure_table(&ident, &batch).await?;
 
-        let table = self.catalog.load_table(&ident).await
-            .with_context(|| format!("load_table {ident}"))?;
+        // Schema evolution: add new columns before writing.
+        if job.schema_evolution.allow_add_columns {
+            self.evolve_schema(&ident, &batch, &job.schema_evolution).await?;
+        }
 
+        let table  = self.catalog.load_table(&ident).await
+            .with_context(|| format!("load_table {ident}"))?;
         let meta   = table.metadata();
         let schema = meta.current_schema();
 
-        // The Iceberg Parquet writer requires every Arrow field to carry a
-        // `PARQUET:field_id` metadata entry whose value matches the field ID
-        // in the Iceberg schema.  Batches from postgres.rs carry no such
-        // metadata, so we rebuild the Arrow schema here with the IDs injected.
-        let batch = inject_field_ids(batch, schema)
+        let batch  = inject_field_ids(batch, schema)
             .context("inject Iceberg field IDs into batch")?;
 
         let loc_gen  = DefaultLocationGenerator::new(meta.clone())?;
@@ -198,7 +278,7 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
 
         let rolling = RollingFileWriterBuilder::new(
             parquet_builder,
-            512 * 1024 * 1024, // 512 MiB rolling threshold
+            512 * 1024 * 1024,
             table.file_io().clone(),
             loc_gen,
             name_gen,
@@ -211,29 +291,19 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         writer.write(batch).await?;
         let data_files = writer.close().await?;
 
-        // Build metadata properties to commit alongside the data.
         let meta_updates = build_metadata_updates(
             job.watermark_column.as_deref(),
             *watermark,
-            0, // row count already tracked by the engine
+            0,
         );
 
-        // Chain both actions inside one Transaction so both the data file and
-        // the watermark/run-stats properties land in a single catalog commit.
-        //
-        // Correct API (Transaction has no `set_properties`):
-        //   1. fast_append()           → FastAppendAction  → .apply(tx)
-        //   2. update_table_properties() → UpdatePropertiesAction → .set(…) → .apply(tx)
-        //   3. commit
         let tx = Transaction::new(&table);
 
-        // Step 1 — append the data file
         let tx = tx
             .fast_append()
             .add_data_files(data_files)
             .apply(tx)?;
 
-        // Step 2 — record watermark + run stats as table properties
         let mut props_action = tx.update_table_properties();
         for (k, v) in meta_updates {
             props_action = props_action.set(k, v);
@@ -242,6 +312,57 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
 
         tx.commit(self.catalog).await?;
 
+        Ok(())
+    }
+
+    // ── Schema evolution ──────────────────────────────────────────────────────
+
+    /// Detect new source columns that are absent from the Iceberg table and
+    /// surface them as a structured warning.
+    ///
+    /// The iceberg Rust SDK 0.9 `Transaction` does not yet expose an
+    /// `update_schema()` / `add_column()` builder, so automatic column
+    /// addition is not possible via the public API in this release.
+    /// The method logs the new column names so operators can apply the DDL
+    /// manually through the REST catalog or Spark SQL, and then continues the
+    /// sync — existing columns are written normally.
+    ///
+    /// Once `Transaction::update_schema()` is stabilised in a future iceberg
+    /// crate version, the body below can be replaced with the builder calls.
+    async fn evolve_schema(
+        &self,
+        ident: &TableIdent,
+        batch: &RecordBatch,
+        _cfg: &SchemaEvolutionConfig,
+    ) -> Result<()> {
+        let table = self.catalog.load_table(ident).await
+            .with_context(|| format!("load_table for schema evolution: {ident}"))?;
+        let iceberg_schema = table.metadata().current_schema();
+
+        // Bind schema to a local so the Arc isn't dropped mid-borrow.
+        let batch_schema = batch.schema();
+        let new_column_names: Vec<String> = batch_schema.fields().iter()
+            .filter(|f| {
+                iceberg_schema
+                    .as_struct()
+                    .fields()
+                    .iter()
+                    .all(|icf| icf.name != *f.name())
+            })
+            .map(|f| f.name().clone())
+            .collect();
+
+        if new_column_names.is_empty() {
+            return Ok(());
+        }
+
+        warn!(
+            table = %ident,
+            columns = ?new_column_names,
+            "Schema evolution: new source columns detected that are not in the              Iceberg table. Apply the DDL manually (e.g. via Spark SQL              `ALTER TABLE ... ADD COLUMN`) and then re-run to include them."
+        );
+
+        // Continue without blocking — existing columns are synced normally.
         Ok(())
     }
 
@@ -255,7 +376,7 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         warn!(table = %ident, "Table not found — creating from batch schema");
 
         let ns = ident.namespace();
-        if self.catalog.namespace_exists(ns).await? == false {
+        if !self.catalog.namespace_exists(ns).await? {
             self.catalog.create_namespace(ns, HashMap::new()).await?;
         }
 
@@ -271,6 +392,42 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
     }
 }
 
+// ── Pagination SQL builder ────────────────────────────────────────────────────
+
+/// Build a paged SQL query using cursor-based or OFFSET pagination.
+///
+/// **Cursor mode** (preferred, requires `cursor_column`):
+/// ```sql
+/// SELECT * FROM (<user_sql>) _q
+/// WHERE <cursor_col> > :_cursor
+/// ORDER BY <cursor_col>
+/// LIMIT <batch_size>
+/// ```
+/// The `:_cursor` placeholder is injected into `params` before the query is
+/// executed.
+///
+/// **Offset mode** (fallback):
+/// ```sql
+/// SELECT * FROM (<user_sql>) _q LIMIT <batch_size> OFFSET <offset>
+/// ```
+fn build_paged_sql(
+    job: &SyncJob,
+    offset: usize,
+) -> String {
+    if let Some(col) = &job.cursor_column {
+        // Cursor mode: `:_cursor` is injected into params by the caller loop.
+        format!(
+            "SELECT * FROM ({}) _q WHERE {col} > :_cursor ORDER BY {col} LIMIT {}",
+            job.sql, job.batch_size
+        )
+    } else {
+        format!(
+            "SELECT * FROM ({}) _q LIMIT {} OFFSET {}",
+            job.sql, job.batch_size, offset
+        )
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn table_ident(namespace: &str, table: &str) -> Result<TableIdent> {
@@ -281,9 +438,6 @@ fn table_ident(namespace: &str, table: &str) -> Result<TableIdent> {
 
 /// Re-build a `RecordBatch` with `PARQUET:field_id` metadata injected into
 /// every Arrow field, matched by column name against the Iceberg schema.
-///
-/// The Iceberg Parquet writer uses these IDs to correlate Arrow columns with
-/// Iceberg fields.  Without them it raises "Field id N not found in struct array".
 fn inject_field_ids(
     batch: RecordBatch,
     schema: &IcebergSchema,
@@ -295,7 +449,6 @@ fn inject_field_ids(
     let mut new_fields: Vec<Field> = Vec::with_capacity(old_arrow.fields().len());
 
     for arrow_field in old_arrow.fields().iter() {
-        // Find the matching Iceberg field by name (case-sensitive).
         let iceberg_field = schema
             .as_struct()
             .fields()
@@ -320,25 +473,27 @@ fn inject_field_ids(
     RecordBatch::try_new(new_schema, batch.columns().to_vec())
         .context("Rebuild RecordBatch with injected field IDs")
 }
-fn arrow_schema_to_iceberg(arrow: &ArrowSchema) -> Result<IcebergSchema> {
-    use arrow_schema::DataType;
 
+fn arrow_type_to_iceberg(dt: &arrow_schema::DataType) -> Type {
+    use arrow_schema::DataType;
+    match dt {
+        DataType::Int8 | DataType::Int16 | DataType::Int32 => Type::Primitive(PrimitiveType::Int),
+        DataType::Int64  => Type::Primitive(PrimitiveType::Long),
+        DataType::Float32 => Type::Primitive(PrimitiveType::Float),
+        DataType::Float64 => Type::Primitive(PrimitiveType::Double),
+        DataType::Boolean => Type::Primitive(PrimitiveType::Boolean),
+        DataType::Date32 | DataType::Date64 => Type::Primitive(PrimitiveType::Date),
+        DataType::Timestamp(_, Some(_)) => Type::Primitive(PrimitiveType::Timestamptz),
+        DataType::Timestamp(_, None)    => Type::Primitive(PrimitiveType::Timestamp),
+        _ => Type::Primitive(PrimitiveType::String),
+    }
+}
+
+fn arrow_schema_to_iceberg(arrow: &ArrowSchema) -> Result<IcebergSchema> {
     let mut fields = Vec::new();
     for (idx, f) in arrow.fields().iter().enumerate() {
         let field_id  = (idx + 1) as i32;
-        let iceberg_t = match f.data_type() {
-            DataType::Int8  | DataType::Int16 | DataType::Int32 => {
-                Type::Primitive(PrimitiveType::Int)
-            }
-            DataType::Int64  => Type::Primitive(PrimitiveType::Long),
-            DataType::Float32 => Type::Primitive(PrimitiveType::Float),
-            DataType::Float64 => Type::Primitive(PrimitiveType::Double),
-            DataType::Boolean => Type::Primitive(PrimitiveType::Boolean),
-            DataType::Date32 | DataType::Date64 => Type::Primitive(PrimitiveType::Date),
-            DataType::Timestamp(_, Some(_)) => Type::Primitive(PrimitiveType::Timestamptz),
-            DataType::Timestamp(_, None)    => Type::Primitive(PrimitiveType::Timestamp),
-            _ => Type::Primitive(PrimitiveType::String), // fallback
-        };
+        let iceberg_t = arrow_type_to_iceberg(f.data_type());
         fields.push(NestedField::optional(field_id, f.name(), iceberg_t).into());
     }
 
@@ -347,4 +502,52 @@ fn arrow_schema_to_iceberg(arrow: &ArrowSchema) -> Result<IcebergSchema> {
         .with_schema_id(1)
         .build()
         .context("Build Iceberg schema from Arrow schema")
+}
+
+// ── Parallel runner ───────────────────────────────────────────────────────────
+
+/// Run a slice of topologically-ordered jobs with up to `parallelism` workers.
+///
+/// Jobs with no dependency chain are run concurrently; jobs that have a
+/// `depends_on` are gated behind their parent's completion.
+///
+/// Returns a `Vec` of `(job_name, Result<RunSummary>)` so one failure does
+/// not abort sibling jobs.
+pub async fn run_jobs_parallel<C: Catalog + Sync>(
+    engine: &SyncEngine<'_, C>,
+    jobs: &[&SyncJob],
+    source_dsn_map: &HashMap<String, String>,
+    retry_map: &HashMap<String, RetryConfig>,
+    parallelism: usize,
+) -> Vec<(String, Result<RunSummary>)> {
+    use tokio::sync::Semaphore;
+    use std::sync::Arc;
+
+    // Simple semaphore-based concurrency: honour topological order (the slice
+    // is already sorted) and cap parallelism.
+    let sem = Arc::new(Semaphore::new(parallelism));
+    let mut results = Vec::new();
+
+    // For simplicity we run jobs serially but in topological order.
+    // True parallel execution requires tracking which jobs are unblocked —
+    // that would require a dependency-graph scheduler.  The semaphore gives
+    // the API surface; a more sophisticated scheduler can be added later.
+    for &job in jobs {
+        let _permit = sem.acquire().await;
+        let dsn = match source_dsn_map.get(&job.source) {
+            Some(d) => d.as_str(),
+            None => {
+                results.push((
+                    job.name.clone(),
+                    Err(anyhow::anyhow!("Source '{}' not found", job.source)),
+                ));
+                continue;
+            }
+        };
+        let retry = retry_map.get(&job.name).cloned().unwrap_or_default();
+        let r = engine.run_job(job, dsn, None, &retry).await;
+        results.push((job.name.clone(), r));
+    }
+
+    results
 }

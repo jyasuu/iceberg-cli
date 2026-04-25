@@ -182,6 +182,18 @@ enum Commands {
         /// Only run this specific job (default: all jobs in dependency order)
         #[arg(long)]
         job: Option<String>,
+
+        /// Only run jobs belonging to this group tag
+        #[arg(long)]
+        group: Option<String>,
+
+        /// Log what would be done without writing any data
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Maximum number of independent jobs to run concurrently (default: 1)
+        #[arg(long, default_value_t = 1)]
+        parallel: usize,
     },
 
     /// Start a RabbitMQ consumer loop (blocks)
@@ -249,8 +261,8 @@ async fn main() -> Result<()> {
         Commands::CreateTable { table, schema } => {
             cmd_create_table(&catalog, table, schema).await?
         }
-        Commands::Sync { config, job } => {
-            cmd_sync(&catalog, config, job.as_deref()).await?
+        Commands::Sync { config, job, group, dry_run, parallel } => {
+            cmd_sync(&catalog, config, job.as_deref(), group.as_deref(), *dry_run, *parallel).await?
         }
         Commands::SyncConsume { .. } => unreachable!(),
     }
@@ -828,34 +840,67 @@ fn json_rows_to_record_batch(rows: &[serde_json::Value], schema: &Schema) -> Res
 
 // ─── Sync commands ────────────────────────────────────────────────────────────
 
-async fn cmd_sync(catalog: &impl Catalog, config_path: &str, only_job: Option<&str>) -> Result<()> {
-    let cfg = SyncConfig::from_file(config_path)?;
-    let engine = SyncEngine::new(catalog);
+async fn cmd_sync(
+    catalog: &impl Catalog,
+    config_path: &str,
+    only_job:   Option<&str>,
+    only_group: Option<&str>,
+    dry_run:    bool,
+    parallel:   usize,
+) -> Result<()> {
+    use sync::engine::run_jobs_parallel;
+    use std::collections::HashMap;
 
-    let jobs = cfg.ordered_jobs()?;
-    let jobs: Vec<_> = match only_job {
-        Some(name) => jobs.into_iter().filter(|j| j.name == name).collect(),
-        None       => jobs,
+    let cfg = SyncConfig::from_file(config_path)?;
+    let engine = if dry_run {
+        SyncEngine::with_dry_run(catalog)
+    } else {
+        SyncEngine::new(catalog)
     };
+
+    // Build the ordered job list, applying filters.
+    let all_jobs = cfg.ordered_jobs()?;
+    let jobs: Vec<_> = all_jobs.into_iter()
+        .filter(|j| only_job.map_or(true,   |n| j.name  == n))
+        .filter(|j| only_group.map_or(true, |g| j.group.as_deref() == Some(g)))
+        .collect();
 
     if jobs.is_empty() {
         println!("No jobs to run.");
         return Ok(());
     }
 
-    for job in jobs {
-        let source = cfg.sources.get(&job.source)
-            .ok_or_else(|| anyhow::anyhow!("Source '{}' not found", job.source))?;
-
-        let summary = engine.run_job(job, &source.dsn, None).await?;
-        println!(
-            "✓  {}  rows={}  watermark={:?}",
-            summary.job_name,
-            summary.rows_written,
-            summary.new_watermark
-        );
+    if dry_run {
+        println!("⚠  dry-run mode — no data will be written");
     }
 
+    // Build DSN and retry maps for the parallel runner.
+    let source_dsn_map: HashMap<String, String> = cfg.sources.iter()
+        .map(|(k, v)| (k.clone(), v.dsn.clone()))
+        .collect();
+    let retry_map: HashMap<String, crate::config::RetryConfig> = jobs.iter()
+        .map(|j| (j.name.clone(), cfg.retry_for(j)))
+        .collect();
+
+    let results = run_jobs_parallel(&engine, &jobs, &source_dsn_map, &retry_map, parallel).await;
+
+    let mut had_error = false;
+    for (name, result) in results {
+        match result {
+            Ok(summary) => println!(
+                "✓  {}  rows={}  watermark={:?}",
+                summary.job_name, summary.rows_written, summary.new_watermark
+            ),
+            Err(e) => {
+                eprintln!("✗  {}  error: {e:#}", name);
+                had_error = true;
+            }
+        }
+    }
+
+    if had_error {
+        anyhow::bail!("One or more sync jobs failed");
+    }
     Ok(())
 }
 
