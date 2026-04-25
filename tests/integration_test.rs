@@ -1088,7 +1088,7 @@ mod rabbitmq {
             .expect("declare queue via management API");
 
         // Publish via management API.
-        let pub_url = format!("http://localhost:15672/api/exchanges/%2f/amq.default/publish");
+        let pub_url = "http://localhost:15672/api/exchanges/%2f/amq.default/publish".to_string();
         let body = serde_json::json!({
             "properties":        {},
             "routing_key":       queue,

@@ -104,7 +104,10 @@ jobs:
           PG_DSN: ${{ env.PG_DSN }}
           RABBITMQ_URI: ${{ env.RABBITMQ_URI }}
 
-      # ── Run shell integration script (optional, belt-and-suspenders) ───────
+      # ── Run shell integration script ───────────────────────────────────────
+      # Runs sequentially after Rust tests complete.
+      # The script uses namespace "shell_integration_test" — distinct from the
+      # Rust test namespace "integration_test" — so there is no data collision.
       - name: Run shell integration tests
         if: ${{ hashFiles('scripts/integration-test.sh') != '' }}
         run: |
@@ -116,6 +119,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ env.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: ${{ env.AWS_REGION }}
+          PG_DSN: ${{ env.PG_DSN }}
 
       # ── Collect logs on failure ────────────────────────────────────────────
       - name: Dump service logs on failure

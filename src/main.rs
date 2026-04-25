@@ -284,6 +284,7 @@ async fn main() -> Result<()> {
 
 // ─── Catalog connection ───────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn connect(
     uri: &str,
     name: &str,
@@ -293,7 +294,7 @@ async fn connect(
     access_key_id: Option<&str>,
     secret_access_key: Option<&str>,
     session_token: Option<&str>,
-) -> Result<impl Catalog + Send + Sync + use<>> {
+) -> Result<impl Catalog + use<>> {
     let mut props = HashMap::from([
         (REST_CATALOG_PROP_URI.to_string(), uri.to_string()),
         ("s3.region".to_string(), region.to_string()),
@@ -877,8 +878,8 @@ async fn cmd_sync(
     let all_jobs = cfg.ordered_jobs()?;
     let jobs: Vec<_> = all_jobs
         .into_iter()
-        .filter(|j| only_job.map_or(true, |n| j.name == n))
-        .filter(|j| only_group.map_or(true, |g| j.group.as_deref() == Some(g)))
+        .filter(|j| only_job.is_none_or(|n| j.name == n))
+        .filter(|j| only_group.is_none_or(|g| j.group.as_deref() == Some(g)))
         .collect();
 
     if jobs.is_empty() {
@@ -923,10 +924,7 @@ async fn cmd_sync(
     Ok(())
 }
 
-async fn cmd_sync_consume(
-    catalog: impl Catalog + Send + Sync + 'static,
-    config_path: &str,
-) -> Result<()> {
+async fn cmd_sync_consume(catalog: impl Catalog + 'static, config_path: &str) -> Result<()> {
     let cfg = Arc::new(SyncConfig::from_file(config_path)?);
     let rmq = cfg
         .rabbitmq

@@ -197,13 +197,13 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
                     }
 
                     // Advance watermark.
-                    if let Some(col) = &job.watermark_column {
-                        if let Some(ts) = max_timestamp_in_batch(&rb, col) {
-                            new_watermark = Some(match new_watermark {
-                                Some(prev) => prev.max(ts),
-                                None => ts,
-                            });
-                        }
+                    if let Some(col) = &job.watermark_column
+                        && let Some(ts) = max_timestamp_in_batch(&rb, col)
+                    {
+                        new_watermark = Some(match new_watermark {
+                            Some(prev) => prev.max(ts),
+                            None => ts,
+                        });
                     }
 
                     // Advance cursor.

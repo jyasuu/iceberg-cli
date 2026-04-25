@@ -59,8 +59,8 @@ pub fn bind_named_params(
         let after = &remaining[pos + 1..];
 
         // `::cast` — skip both colons.
-        if after.starts_with(':') {
-            remaining = &after[1..];
+        if let Some(stripped) = after.strip_prefix(':') {
+            remaining = stripped;
             continue;
         }
 

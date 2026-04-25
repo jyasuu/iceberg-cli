@@ -123,10 +123,10 @@ impl SyncConfig {
                 name
             );
             visiting.insert(name);
-            if let Some(job) = jobs.iter().find(|j| j.name == name) {
-                if let Some(dep) = &job.depends_on {
-                    dfs(dep, jobs, visiting, visited)?;
-                }
+            if let Some(job) = jobs.iter().find(|j| j.name == name)
+                && let Some(dep) = &job.depends_on
+            {
+                dfs(dep, jobs, visiting, visited)?;
             }
             visiting.remove(name);
             visited.insert(name);
@@ -172,6 +172,7 @@ impl SyncConfig {
     }
 
     /// Jobs filtered by group name, topologically ordered.
+    #[allow(dead_code)]
     pub fn ordered_jobs_for_group<'a>(&'a self, group: &str) -> anyhow::Result<Vec<&'a SyncJob>> {
         let all = self.ordered_jobs()?;
         Ok(all

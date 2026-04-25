@@ -12,7 +12,11 @@
 # Pass --keep-data to skip namespace teardown (useful for manual inspection).
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail
+# NOTE: -e is intentionally omitted. ((FAIL++)) evaluates to exit code 1 when
+# FAIL goes from 0 to 1 (arithmetic 0 is falsy in bash), which would abort the
+# script under -e before we can print the summary.  We track failures manually
+# and exit 1 at the end if any test failed.
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 ICEBERG_URI="${ICEBERG_URI:-http://localhost:8181}"
@@ -22,7 +26,7 @@ AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-password}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 
 CLI="${CLI:-./target/release/iceberg-cli}"
-NS="integration_test"          # namespace used throughout
+NS="shell_integration_test"    # distinct from Rust test namespace (integration_test)
 KEEP_DATA="${1:-}"             # pass --keep-data to retain state after run
 
 # Colour helpers
@@ -48,13 +52,12 @@ assert_ok() {
     local name="$1"; shift
     if output=$(cli "$@" 2>&1); then
         echo -e "${GREEN}PASS${NC}  $name"
-        ((PASS++))
+        PASS=$(( PASS + 1 ))
     else
         echo -e "${RED}FAIL${NC}  $name"
         echo      "      Command : cli $*"
         echo      "      Output  : $output"
-        ((FAIL++))
-        return 1
+        FAIL=$(( FAIL + 1 ))
     fi
 }
 
@@ -65,18 +68,16 @@ assert_output() {
     if output=$(cli "$@" 2>&1); then
         if echo "$output" | grep -qF "$expected"; then
             echo -e "${GREEN}PASS${NC}  $name"
-            ((PASS++))
+            PASS=$(( PASS + 1 ))
         else
             echo -e "${RED}FAIL${NC}  $name  (output missing: '$expected')"
             echo      "      Output: $output"
-            ((FAIL++))
-            return 1
+            FAIL=$(( FAIL + 1 ))
         fi
     else
         echo -e "${RED}FAIL${NC}  $name  (command failed)"
         echo      "      Output: $output"
-        ((FAIL++))
-        return 1
+        FAIL=$(( FAIL + 1 ))
     fi
 }
 
@@ -86,11 +87,10 @@ assert_fail() {
     local name="$1"; shift
     if output=$(cli "$@" 2>&1); then
         echo -e "${RED}FAIL${NC}  $name  (expected failure, but command succeeded)"
-        ((FAIL++))
-        return 1
+        FAIL=$(( FAIL + 1 ))
     else
         echo -e "${GREEN}PASS${NC}  $name  (correctly rejected)"
-        ((PASS++))
+        PASS=$(( PASS + 1 ))
     fi
 }
 
