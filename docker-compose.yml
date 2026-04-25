@@ -23,7 +23,7 @@ services:
       - 10000:10000
       - 10001:10001
 
-  # ── Iceberg REST catalog ────────────────────────────────────────────────────
+  # ── Iceberg REST catalog ─────────────────────────────────────────────────────
   rest:
     image: apache/iceberg-rest-fixture
     container_name: iceberg-rest
@@ -35,14 +35,14 @@ services:
       - AWS_ACCESS_KEY_ID=admin
       - AWS_SECRET_ACCESS_KEY=password
       - AWS_REGION=us-east-1
-      - CATALOG_WAREHOUSE=s3://warehouse/
+      - CATALOG_WAREHOUSE=s3a://warehouse/
       - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
       - CATALOG_S3_ENDPOINT=http://minio:9000
     depends_on:
       mc:
         condition: service_started
 
-  # ── MinIO object store ──────────────────────────────────────────────────────
+  # ── MinIO object store ───────────────────────────────────────────────────────
   minio:
     image: minio/minio
     container_name: minio
@@ -64,7 +64,7 @@ services:
       timeout: 5s
       retries: 10
 
-  # ── MinIO bucket bootstrap ──────────────────────────────────────────────────
+  # ── MinIO bucket bootstrap ───────────────────────────────────────────────────
   mc:
     image: minio/mc
     container_name: mc
@@ -87,8 +87,7 @@ services:
       tail -f /dev/null
       "
 
-
-  # ── PostgreSQL source database ──────────────────────────────────────────────
+  # ── PostgreSQL source database ───────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     container_name: iceberg-postgres
@@ -108,6 +107,25 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # ── RabbitMQ message broker ──────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: iceberg-rabbitmq
+    networks:
+      iceberg_net:
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI  (guest/guest)
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 15
+
 
 networks:
   iceberg_net:
