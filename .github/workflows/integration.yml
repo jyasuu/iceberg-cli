@@ -1,0 +1,131 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  # Allow manual trigger for debugging
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Match docker-compose defaults
+  ICEBERG_URI: http://localhost:8181
+  S3_ENDPOINT: http://localhost:9000
+  AWS_ACCESS_KEY_ID: admin
+  AWS_SECRET_ACCESS_KEY: password
+  AWS_REGION: us-east-1
+  PG_DSN: "host=localhost port=5432 dbname=shop user=app password=secret sslmode=disable"
+  RABBITMQ_URI: "amqp://guest:guest@localhost:5672/%2f"
+
+jobs:
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Build release binary ───────────────────────────────────────────────
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-integration-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # ── Spin up infrastructure ─────────────────────────────────────────────
+      # Bring up only the services needed: skip spark-iceberg (heavy, not
+      # required for CLI integration tests).
+      - name: Start docker-compose services
+        run: |
+          docker compose up -d \
+            minio \
+            mc \
+            rest \
+            postgres \
+            rabbitmq
+
+      - name: Wait for services to be healthy
+        timeout-minutes: 3
+        run: |
+          echo "Waiting for MinIO..."
+          until curl -sf http://localhost:9000/minio/health/live; do
+            sleep 2
+          done
+
+          echo "Waiting for Iceberg REST catalog..."
+          until curl -sf http://localhost:8181/v1/config; do
+            sleep 2
+          done
+
+          echo "Waiting for PostgreSQL..."
+          until pg_isready -h localhost -p 5432 -U app -d shop; do
+            sleep 2
+          done
+
+          echo "Waiting for RabbitMQ..."
+          until curl -sf -u guest:guest http://localhost:15672/api/healthchecks/node; do
+            sleep 2
+          done
+
+          echo "All services ready."
+
+      # ── Run Rust integration tests ─────────────────────────────────────────
+      # Tests require the release binary (cli_bin() resolves target/release).
+      # --test-threads=1 avoids namespace/table name collisions between tests.
+      - name: Run integration tests (Rust)
+        run: |
+          cargo test \
+            --release \
+            --test integration_test \
+            -- \
+            --test-threads=1 \
+            --nocapture
+        env:
+          ICEBERG_URI: ${{ env.ICEBERG_URI }}
+          S3_ENDPOINT: ${{ env.S3_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ env.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          PG_DSN: ${{ env.PG_DSN }}
+          RABBITMQ_URI: ${{ env.RABBITMQ_URI }}
+
+      # ── Run shell integration script (optional, belt-and-suspenders) ───────
+      - name: Run shell integration tests
+        if: ${{ hashFiles('scripts/integration-test.sh') != '' }}
+        run: |
+          chmod +x scripts/integration-test.sh
+          CLI=./target/release/iceberg-cli bash scripts/integration-test.sh
+        env:
+          ICEBERG_URI: ${{ env.ICEBERG_URI }}
+          S3_ENDPOINT: ${{ env.S3_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ env.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+
+      # ── Collect logs on failure ────────────────────────────────────────────
+      - name: Dump service logs on failure
+        if: failure()
+        run: |
+          echo "=== iceberg-rest ===" && docker compose logs rest        || true
+          echo "=== minio ===" && docker compose logs minio              || true
+          echo "=== postgres ===" && docker compose logs postgres        || true
+          echo "=== rabbitmq ===" && docker compose logs rabbitmq        || true
+
+      - name: Stop services
+        if: always()
+        run: docker compose down -v --remove-orphans
