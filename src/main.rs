@@ -212,6 +212,13 @@ enum Commands {
         #[arg(long)]
         schema: String,
     },
+
+    /// Drop a table (idempotent — silently skips if it does not exist)
+    DropTable {
+        /// Fully-qualified table: namespace.table
+        #[arg(long)]
+        table: String,
+    },
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -259,6 +266,7 @@ async fn main() -> Result<()> {
         Commands::CreateTable { table, schema } => {
             cmd_create_table(&catalog, table, schema).await?
         }
+        Commands::DropTable { table } => cmd_drop_table(&catalog, table).await?,
         Commands::Sync {
             config,
             job,
@@ -579,6 +587,25 @@ async fn cmd_create_namespace(catalog: &impl Catalog, namespace: &str) -> Result
                 println!("Namespace '{namespace}' already exists — skipping.");
             } else {
                 return Err(e).with_context(|| format!("create_namespace({namespace})"));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_drop_table(catalog: &impl Catalog, table_str: &str) -> Result<()> {
+    let ident = parse_table(table_str)?;
+    match catalog.drop_table(&ident).await {
+        Ok(_) => println!("Dropped table '{table_str}'."),
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("does not exist")
+                || msg.contains("not found")
+                || msg.contains("no such")
+            {
+                println!("Table '{table_str}' does not exist — skipping.");
+            } else {
+                return Err(e).with_context(|| format!("drop_table({table_str})"));
             }
         }
     }

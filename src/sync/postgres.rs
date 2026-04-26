@@ -219,7 +219,29 @@ fn rows_to_batch(rows: &[Row]) -> Result<Option<RecordBatch>> {
             }
 
             // ── Timestamps ────────────────────────────────────────────────────
-            &Type::TIMESTAMPTZ | &Type::TIMESTAMP => {
+            // TIMESTAMPTZ is stored by tokio-postgres as DateTime<Utc>;
+            // TIMESTAMP (no tz) is stored as NaiveDateTime.
+            // Reading TIMESTAMPTZ as NaiveDateTime silently returns None for
+            // every row, which causes the watermark column to come back all-NULL
+            // and breaks incremental sync.
+            &Type::TIMESTAMPTZ => {
+                let vals: Vec<Option<i64>> = rows
+                    .iter()
+                    .map(|r| {
+                        r.try_get::<_, Option<DateTime<Utc>>>(col_idx)
+                            .ok()
+                            .flatten()
+                            .map(|ts| ts.timestamp_micros())
+                    })
+                    .collect();
+                fields.push(Field::new(
+                    &name,
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    true,
+                ));
+                columns.push(Arc::new(TimestampMicrosecondArray::from(vals)) as ArrayRef);
+            }
+            &Type::TIMESTAMP => {
                 let vals: Vec<Option<i64>> = rows
                     .iter()
                     .map(|r| {

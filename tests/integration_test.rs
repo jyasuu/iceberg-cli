@@ -89,6 +89,7 @@ fn assert_ok(label: &str, args: &[&str]) -> String {
     let out = cli(args);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    println!("[{label}] expected success\nstdout: {stdout}\nstderr: {stderr}");
     assert!(
         out.status.success(),
         "[{label}] expected success\nstdout: {stdout}\nstderr: {stderr}"
@@ -1278,6 +1279,719 @@ rabbitmq:
             // Start consumer, let it declare the queue, then stop.
             run_consumer_briefly(cfg, Duration::from_secs(2));
             // If we reached here without panic, the DLX config was accepted.
+        });
+    }
+}
+
+// =============================================================================
+// § 13 – Time-series incremental sync: multi-stage (insert → sync) × N
+//
+// These tests simulate a realistic CDC pipeline:
+//
+//   Stage 1: baseline data already in Postgres (from init.sql)
+//   Stage 2: insert batch-2 rows  → sync  → assert only batch-2 arrives
+//   Stage 3: insert batch-3 rows  → sync  → assert only batch-3 arrives
+//   ...
+//
+// Key invariants checked after every stage:
+//   • Total Iceberg row count equals exactly the cumulative expected count.
+//   • The `sync.watermark.<col>` property in table metadata advances each run.
+//   • A subsequent sync with no new data writes 0 extra rows (idempotency).
+//   • Rows from earlier stages are never lost (at-least-once, no overwrites).
+//
+// Isolation strategy
+// ──────────────────
+// Every test gets its own Iceberg namespace AND its own Postgres source table,
+// both named after the test function (e.g. `itest_ts_t13_1`).  This guarantees
+// that:
+//   • Tests can run in parallel without stomping on each other's watermarks.
+//   • Each test starts with a clean Iceberg table (no stale watermark from a
+//     previous run in the same process).
+//   • The `DROP TABLE … CREATE TABLE` DDL in setup() is safe even under
+//     parallel execution because every table name is unique.
+//
+// PostgreSQL multi-statement DDL
+// ──────────────────────────────
+// psql's `-c` flag executes only ONE statement reliably.  Passing a
+// semicolon-separated string may silently drop subsequent statements on some
+// versions.  All setup DDL is therefore split into individual `pg_exec` calls.
+// =============================================================================
+#[cfg(test)]
+mod time_series {
+    use super::*;
+    use std::net::TcpStream;
+
+    fn pg_reachable() -> bool {
+        TcpStream::connect("localhost:5432").is_ok()
+    }
+
+    // ── PostgreSQL helper ─────────────────────────────────────────────────────
+    //
+    // Execute a SINGLE SQL statement via psql.  Do not pass multiple
+    // semicolon-separated statements — split them into separate calls instead.
+    fn pg_exec(sql: &str) {
+        let dsn = pg_dsn();
+        let mut host = "localhost";
+        let mut port = "5432";
+        let mut dbname = "shop";
+        let mut user = "app";
+        let mut password = "secret";
+        for pair in dsn.split_whitespace() {
+            if let Some((k, v)) = pair.split_once('=') {
+                match k {
+                    "host" => host = v,
+                    "port" => port = v,
+                    "dbname" => dbname = v,
+                    "user" => user = v,
+                    "password" => password = v,
+                    _ => {}
+                }
+            }
+        }
+        let out = std::process::Command::new("psql")
+            .env("PGPASSWORD", password)
+            .args(["-h", host, "-p", port, "-U", user, "-d", dbname, "-c", sql])
+            .output()
+            .expect("psql not found — is postgres client installed?");
+        assert!(
+            out.status.success(),
+            "pg_exec failed:\nSQL: {sql}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // ── Per-test isolation helpers ────────────────────────────────────────────
+
+    /// Derive a short, filesystem-safe identifier from a test name.
+    ///
+    /// We truncate to 24 characters so the combined namespace + table name
+    /// stays well within Iceberg/S3 limits.
+    fn test_id(name: &str) -> String {
+        // Keep only alphanumerics and underscores; strip the leading "t13_N_"
+        // prefix to save space, then truncate.
+        let clean: String = name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        clean.chars().take(24).collect()
+    }
+
+    /// Iceberg namespace for this test (unique per test function).
+    fn ts_ns(id: &str) -> String {
+        format!("itest_ts_{id}")
+    }
+
+    /// Iceberg destination table name (constant within a test).
+    fn ts_iceberg_table() -> &'static str {
+        "ts_events"
+    }
+
+    /// Postgres source table name (unique per test function).
+    fn pg_table(id: &str) -> String {
+        format!("ts_src_{id}")
+    }
+
+    // ── Setup (per-test, idempotent) ──────────────────────────────────────────
+    //
+    // Creates:
+    //   • An Iceberg namespace  (itest_ts_<id>)
+    //   • A Postgres table      (ts_src_<id>)
+    //
+    // The Postgres DDL is split into separate statements so psql -c works
+    // correctly on every supported version.
+    fn setup(id: &str) {
+        preflight();
+        let ns = ts_ns(id);
+        let pg_tbl = pg_table(id);
+
+        cli(&["create-namespace", "--namespace", &ns]);
+
+        // Drop the Iceberg destination table if it exists from a previous run.
+        // Without this, a stale watermark would cause the engine to skip all
+        // rows whose timestamps fall at or below the old high-water mark.
+        cli(&[
+            "drop-table",
+            "--table",
+            &format!("{ns}.{}", ts_iceberg_table()),
+        ]);
+
+        // Drop if exists (separate statement — psql -c handles one at a time).
+        pg_exec(&format!("DROP TABLE IF EXISTS {pg_tbl}"));
+
+        pg_exec(&format!(
+            "CREATE TABLE {pg_tbl} ( \
+               id       BIGSERIAL PRIMARY KEY, \
+               stage    INT         NOT NULL, \
+               label    TEXT        NOT NULL, \
+               value    BIGINT      NOT NULL DEFAULT 0, \
+               event_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
+             )"
+        ));
+
+        pg_exec(&format!("CREATE INDEX ON {pg_tbl}(event_at)"));
+    }
+
+    // ── Sync-config factory ───────────────────────────────────────────────────
+    //
+    // event_at offsets in the SQL are deliberately far in the past relative to
+    // test start, so we use ABSOLUTE timestamps (inserted with a fixed past
+    // anchor) rather than NOW() + small offsets.  See `insert_rows` below.
+    fn ts_sync_config(id: &str) -> String {
+        let ns = ts_ns(id);
+        let pg_tbl = pg_table(id);
+        format!(
+            r#"
+sources:
+  ts_pg:
+    type: postgres
+    dsn: "{pg}"
+destinations:
+  warehouse:
+    catalog_uri: "{iceberg}"
+    s3_endpoint:  "{s3}"
+    region:       "{region}"
+    access_key_id: "{ak}"
+    secret_access_key: "{sk}"
+sync_jobs:
+  - name: sync_ts_events
+    source: ts_pg
+    destination: warehouse
+    namespace: {ns}
+    table: {table}
+    sql: |
+      SELECT id, stage, label, value, event_at
+      FROM {pg_tbl}
+      WHERE event_at > :watermark
+      ORDER BY event_at ASC, id ASC
+    watermark_column: event_at
+    cursor_column:    id
+    batch_size: 10
+    mode: incremental
+"#,
+            pg = pg_dsn(),
+            iceberg = iceberg_uri(),
+            s3 = s3_endpoint(),
+            region = region(),
+            ak = access_key(),
+            sk = secret_key(),
+            ns = ns,
+            table = ts_iceberg_table(),
+            pg_tbl = pg_tbl,
+        )
+    }
+
+    // ── Data-insertion helper ─────────────────────────────────────────────────
+    //
+    // Rows are inserted with an ABSOLUTE timestamp calculated as:
+    //
+    //   TIMESTAMP '2020-01-01 00:00:00 UTC' + INTERVAL '<epoch_offset> seconds'
+    //
+    // Using a fixed past epoch (2020-01-01) means:
+    //   • All inserted timestamps are well in the past → no clock-skew issues.
+    //   • The watermark (which is also stored as an absolute timestamp) will
+    //     always compare correctly with `>` regardless of when the test runs.
+    //   • Distinct stages use non-overlapping offset ranges, so watermarks are
+    //     strictly monotone across stages.
+    //
+    // `epoch_offset_secs` is the number of seconds since 2020-01-01 00:00 UTC.
+    fn insert_rows(pg_tbl: &str, stage: u32, rows: &[(&str, i64, i64)]) {
+        for (label, value, epoch_offset) in rows {
+            pg_exec(&format!(
+                "INSERT INTO {pg_tbl} (stage, label, value, event_at) \
+                 VALUES ({stage}, '{label}', {value}, \
+                         TIMESTAMP '2020-01-01 00:00:00 UTC' + INTERVAL '{epoch_offset} seconds')"
+            ));
+        }
+    }
+
+    // ── Post-sync assertion helpers ───────────────────────────────────────────
+
+    /// Parse "N rows shown" from the tail of a scan's stdout.
+    fn scan_row_count(full_table: &str) -> usize {
+        let out = assert_ok(
+            &format!("scan {full_table}"),
+            &["scan", "--table", full_table, "--limit", "9999"],
+        );
+        out.lines()
+            .rev()
+            .find_map(|line| {
+                // Format: "(N rows shown, limit=9999)"
+                let trimmed = line.trim().trim_start_matches('(');
+                trimmed
+                    .split_once(" rows shown")
+                    .and_then(|(n, _)| n.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    /// Return the value of the `sync.watermark.*` property from `describe`.
+    /// Panics with a helpful message if the property is absent.
+    fn read_watermark(full_table: &str) -> String {
+        let out = assert_ok(
+            &format!("describe {full_table}"),
+            &["describe", "--table", full_table],
+        );
+        let line = out.lines().find(|l| l.contains("sync.watermark."));
+        println!("=====================================");
+        println!("{:?}", line);
+        println!("=====================================");
+        out.lines()
+            .find(|l| l.contains("sync.watermark."))
+            .unwrap_or_else(|| {
+                panic!(
+                    "No sync.watermark.* property in describe output for {full_table}:\n{out}\n\n\
+                     Hint: the sync engine only writes this property when at least one row \
+                     was synced.  Check that the inserted timestamps are older than the \
+                     current watermark and that the SQL WHERE clause matches them."
+                )
+            })
+            .split('┆')
+            .nth(1) // ✓ index 1 is the value cell
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('│') // strip the trailing │
+            .trim()
+            .to_string()
+    }
+
+    /// Insert rows, run the sync job, then read and return the new watermark.
+    fn stage_and_watermark(
+        stage: u32,
+        rows: &[(&str, i64, i64)],
+        pg_tbl: &str,
+        config_path: &str,
+        full_table: &str,
+    ) -> String {
+        insert_rows(pg_tbl, stage, rows);
+        assert_ok(
+            &format!("stage {stage} sync"),
+            &["sync", "--config", config_path, "--job", "sync_ts_events"],
+        );
+        read_watermark(full_table)
+    }
+
+    // =========================================================================
+    // Test 13.1 — Three-stage pipeline: watermark advances each run
+    //
+    // Stage 1: 3 rows at epoch offsets 1 s, 2 s, 3 s
+    // Stage 2: 3 rows at epoch offsets 10 s, 11 s, 12 s
+    // Stage 3: 2 rows at epoch offsets 20 s, 21 s
+    //
+    // After each sync:
+    //   • Cumulative Iceberg row count == expected
+    //   • Watermark is strictly greater than the previous stage's watermark
+    // =========================================================================
+    #[test]
+    fn t13_1_watermark_advances_across_three_stages() {
+        if !pg_reachable() {
+            eprintln!("SKIP: postgres not reachable");
+            return;
+        }
+        let id = test_id("t13_1");
+        setup(&id);
+        let pg_tbl = pg_table(&id);
+        let full_table = format!("{}.{}", ts_ns(&id), ts_iceberg_table());
+
+        with_sync_config(&ts_sync_config(&id), |cfg| {
+            // Stage 1
+            let wm1 = stage_and_watermark(
+                1,
+                &[("alpha", 100, 1), ("beta", 200, 2), ("gamma", 300, 3)],
+                &pg_tbl,
+                cfg,
+                &full_table,
+            );
+            assert_eq!(scan_row_count(&full_table), 3, "stage 1: expected 3 rows");
+            assert!(!wm1.is_empty(), "stage 1: watermark must be set");
+
+            // Stage 2
+            let wm2 = stage_and_watermark(
+                2,
+                &[("delta", 400, 10), ("epsilon", 500, 11), ("zeta", 600, 12)],
+                &pg_tbl,
+                cfg,
+                &full_table,
+            );
+            assert_eq!(
+                scan_row_count(&full_table),
+                6,
+                "stage 2: expected 6 cumulative rows"
+            );
+            assert!(
+                wm2 > wm1,
+                "stage 2: watermark must advance\n  wm1={wm1}\n  wm2={wm2}"
+            );
+
+            // Stage 3
+            let wm3 = stage_and_watermark(
+                3,
+                &[("eta", 700, 20), ("theta", 800, 21)],
+                &pg_tbl,
+                cfg,
+                &full_table,
+            );
+            assert_eq!(
+                scan_row_count(&full_table),
+                8,
+                "stage 3: expected 8 cumulative rows"
+            );
+            assert!(
+                wm3 > wm2,
+                "stage 3: watermark must advance\n  wm2={wm2}\n  wm3={wm3}"
+            );
+        });
+    }
+
+    // =========================================================================
+    // Test 13.2 — Idempotency: re-running sync with no new data writes 0 rows
+    // =========================================================================
+    #[test]
+    fn t13_2_no_new_data_sync_is_a_noop() {
+        if !pg_reachable() {
+            eprintln!("SKIP: postgres not reachable");
+            return;
+        }
+        let id = test_id("t13_2");
+        setup(&id);
+        let pg_tbl = pg_table(&id);
+        let full_table = format!("{}.{}", ts_ns(&id), ts_iceberg_table());
+
+        with_sync_config(&ts_sync_config(&id), |cfg| {
+            // Seed one stage.
+            stage_and_watermark(1, &[("a", 1, 1), ("b", 2, 2)], &pg_tbl, cfg, &full_table);
+            let count_after_first = scan_row_count(&full_table);
+            assert_eq!(count_after_first, 2, "expected 2 rows after first sync");
+
+            // Re-sync without any new inserts.
+            assert_ok(
+                "13.2 noop sync",
+                &["sync", "--config", cfg, "--job", "sync_ts_events"],
+            );
+            let count_after_noop = scan_row_count(&full_table);
+            assert_eq!(
+                count_after_noop, count_after_first,
+                "noop sync must not add rows: expected {count_after_first}, got {count_after_noop}"
+            );
+        });
+    }
+
+    // =========================================================================
+    // Test 13.3 — Cursor pagination: 25 rows with batch_size=10
+    //
+    // The engine must page through 3 pages (10+10+5) and land all 25 rows.
+    // =========================================================================
+    #[test]
+    fn t13_3_cursor_pagination_lands_all_rows() {
+        if !pg_reachable() {
+            eprintln!("SKIP: postgres not reachable");
+            return;
+        }
+        let id = test_id("t13_3");
+        setup(&id);
+        let pg_tbl = pg_table(&id);
+        let full_table = format!("{}.{}", ts_ns(&id), ts_iceberg_table());
+
+        with_sync_config(&ts_sync_config(&id), |cfg| {
+            // 25 rows with strictly increasing epoch offsets (+1 s each).
+            let rows: Vec<(&str, i64, i64)> = (1i64..=25).map(|i| ("page_test", i, i)).collect();
+
+            stage_and_watermark(1, &rows, &pg_tbl, cfg, &full_table);
+            let count = scan_row_count(&full_table);
+            assert_eq!(
+                count, 25,
+                "cursor pagination: expected 25 rows, got {count}"
+            );
+        });
+    }
+
+    // =========================================================================
+    // Test 13.4 — Five-stage pipeline with varying batch sizes
+    //
+    //   Stage 1:  5 rows  → cumulative  5
+    //   Stage 2:  1 row   → cumulative  6
+    //   Stage 3: 10 rows  → cumulative 16
+    //   Stage 4:  3 rows  → cumulative 19
+    //   Stage 5:  7 rows  → cumulative 26
+    //
+    // Watermark must be strictly monotonically increasing across all stages.
+    // =========================================================================
+    #[test]
+    fn t13_4_five_stage_monotone_watermark() {
+        if !pg_reachable() {
+            eprintln!("SKIP: postgres not reachable");
+            return;
+        }
+        let id = test_id("t13_4");
+        setup(&id);
+        let pg_tbl = pg_table(&id);
+        let full_table = format!("{}.{}", ts_ns(&id), ts_iceberg_table());
+
+        // (stage_id, row_count, base_epoch_offset_secs)
+        // Offsets are non-overlapping across stages so watermarks are distinct.
+        let stages: &[(u32, usize, i64)] = &[
+            (1, 5, 100),
+            (2, 1, 200),
+            (3, 10, 300),
+            (4, 3, 500),
+            (5, 7, 700),
+        ];
+
+        with_sync_config(&ts_sync_config(&id), |cfg| {
+            let mut prev_wm = String::new();
+            let mut expected_total: usize = 0;
+
+            for &(stage_id, row_count, base_offset) in stages {
+                let rows: Vec<(&str, i64, i64)> = (0..row_count)
+                    .map(|i| {
+                        (
+                            "multi_stage",
+                            stage_id as i64 * 100 + i as i64,
+                            base_offset + i as i64,
+                        )
+                    })
+                    .collect();
+
+                let wm = stage_and_watermark(stage_id, &rows, &pg_tbl, cfg, &full_table);
+                expected_total += row_count;
+
+                let count = scan_row_count(&full_table);
+                assert_eq!(
+                    count, expected_total,
+                    "stage {stage_id}: expected {expected_total} cumulative rows, got {count}"
+                );
+
+                if !prev_wm.is_empty() {
+                    assert!(
+                        wm > prev_wm,
+                        "stage {stage_id}: watermark must be > previous\n  prev={prev_wm}\n  curr={wm}"
+                    );
+                }
+                prev_wm = wm;
+            }
+        });
+    }
+
+    // =========================================================================
+    // Test 13.5 — Watermark does not regress after a noop sync
+    //
+    // 1. Run a normal stage → establishes wm1.
+    // 2. Run sync again with no new data → watermark must stay at wm1.
+    // 3. Insert new data and sync again → wm2 must be > wm1.
+    // =========================================================================
+    #[test]
+    fn t13_5_watermark_does_not_regress_after_noop() {
+        if !pg_reachable() {
+            eprintln!("SKIP: postgres not reachable");
+            return;
+        }
+        let id = test_id("t13_5");
+        setup(&id);
+        let pg_tbl = pg_table(&id);
+        let full_table = format!("{}.{}", ts_ns(&id), ts_iceberg_table());
+
+        with_sync_config(&ts_sync_config(&id), |cfg| {
+            // Stage 1 — establish a watermark.
+            let wm1 = stage_and_watermark(
+                1,
+                &[("x", 1, 100), ("y", 2, 101)],
+                &pg_tbl,
+                cfg,
+                &full_table,
+            );
+
+            // Noop sync — no inserts.
+            assert_ok(
+                "13.5 noop",
+                &["sync", "--config", cfg, "--job", "sync_ts_events"],
+            );
+            let wm_after_noop = read_watermark(&full_table);
+            assert_eq!(
+                wm_after_noop, wm1,
+                "noop sync must not change watermark\n  wm1={wm1}\n  after noop={wm_after_noop}"
+            );
+
+            // Stage 2 — new data at later offsets; watermark must advance.
+            let wm2 = stage_and_watermark(2, &[("z", 3, 500)], &pg_tbl, cfg, &full_table);
+            let count = scan_row_count(&full_table);
+            assert_eq!(count, 3, "expected 3 total rows after stage 2");
+            assert!(
+                wm2 > wm1,
+                "stage 2 watermark must be > stage 1\n  wm1={wm1}\n  wm2={wm2}"
+            );
+        });
+    }
+
+    // =========================================================================
+    // Test 13.6 — Parent-child (header + lines) joint watermark across stages
+    //
+    // Simulates the orders/order_items pattern.  Two jobs share an `event_at`
+    // watermark driven by the parent (ts_headers), propagated to the child
+    // (ts_lines) via a JOIN.
+    //
+    //   Stage 1: 1 header + 3 lines → cumulative headers=1, lines=3
+    //   Stage 2: 1 header + 2 lines → cumulative headers=2, lines=5
+    //   Stage 3: 1 header + 5 lines → cumulative headers=3, lines=10
+    //
+    // After each stage both cumulative counts are asserted.
+    // =========================================================================
+    #[test]
+    fn t13_6_parent_child_joint_watermark_stages() {
+        if !pg_reachable() {
+            eprintln!("SKIP: postgres not reachable");
+            return;
+        }
+        let id = test_id("t13_6");
+        preflight();
+        let ns = ts_ns(&id);
+        cli(&["create-namespace", "--namespace", &ns]);
+
+        // Drop stale Iceberg tables from a previous run so watermarks start fresh.
+        cli(&["drop-table", "--table", &format!("{ns}.ts_headers_iceberg")]);
+        cli(&["drop-table", "--table", &format!("{ns}.ts_lines_iceberg")]);
+
+        // Postgres table names (unique to this test).
+        let hdr_tbl = format!("ts_hdr_{id}");
+        let lines_tbl = format!("ts_lines_{id}");
+
+        // Drop existing tables (separate statements — one psql -c per call).
+        pg_exec(&format!("DROP TABLE IF EXISTS {lines_tbl}"));
+        pg_exec(&format!("DROP TABLE IF EXISTS {hdr_tbl}"));
+
+        pg_exec(&format!(
+            "CREATE TABLE {hdr_tbl} ( \
+               id       BIGSERIAL PRIMARY KEY, \
+               stage    INT         NOT NULL, \
+               label    TEXT        NOT NULL, \
+               event_at TIMESTAMPTZ NOT NULL \
+             )"
+        ));
+        pg_exec(&format!("CREATE INDEX ON {hdr_tbl}(event_at)"));
+
+        pg_exec(&format!(
+            "CREATE TABLE {lines_tbl} ( \
+               id        BIGSERIAL PRIMARY KEY, \
+               header_id BIGINT NOT NULL REFERENCES {hdr_tbl}(id), \
+               seq       INT    NOT NULL, \
+               amount    BIGINT NOT NULL \
+             )"
+        ));
+
+        let cfg_yaml = format!(
+            r#"
+sources:
+  ts_pg:
+    type: postgres
+    dsn: "{pg}"
+destinations:
+  warehouse:
+    catalog_uri: "{iceberg}"
+    s3_endpoint:  "{s3}"
+    region:       "{region}"
+    access_key_id: "{ak}"
+    secret_access_key: "{sk}"
+sync_jobs:
+  - name: sync_headers
+    source: ts_pg
+    destination: warehouse
+    namespace: {ns}
+    table: ts_headers_iceberg
+    sql: |
+      SELECT id, stage, label, event_at
+      FROM {hdr_tbl}
+      WHERE event_at > :watermark
+      ORDER BY event_at ASC, id ASC
+    watermark_column: event_at
+    cursor_column:    id
+    batch_size: 20
+    mode: incremental
+
+  - name: sync_lines
+    source: ts_pg
+    destination: warehouse
+    namespace: {ns}
+    table: ts_lines_iceberg
+    sql: |
+      SELECT l.id, l.header_id, l.seq, l.amount, h.event_at
+      FROM {lines_tbl} l
+      JOIN {hdr_tbl} h ON h.id = l.header_id
+      WHERE h.event_at > :watermark
+      ORDER BY h.event_at ASC, l.id ASC
+    watermark_column: event_at
+    cursor_column:    id
+    depends_on:       sync_headers
+    batch_size: 20
+    mode: incremental
+"#,
+            pg = pg_dsn(),
+            iceberg = iceberg_uri(),
+            s3 = s3_endpoint(),
+            region = region(),
+            ak = access_key(),
+            sk = secret_key(),
+            ns = ns,
+            hdr_tbl = hdr_tbl,
+            lines_tbl = lines_tbl,
+        );
+
+        // Helper: insert one header + N lines at a fixed past timestamp, then
+        // run both jobs (depends_on order is handled automatically by `sync`).
+        let insert_and_sync = |stage: u32, n_lines: usize, epoch_offset: i64, cfg: &str| {
+            // Insert header with an absolute past timestamp.
+            pg_exec(&format!(
+                "INSERT INTO {hdr_tbl} (stage, label, event_at) \
+                 VALUES ({stage}, 'hdr-{stage}', \
+                         TIMESTAMP '2020-01-01 00:00:00 UTC' + INTERVAL '{epoch_offset} seconds')"
+            ));
+            // Insert lines referencing the just-inserted header.
+            for seq in 1..=n_lines {
+                pg_exec(&format!(
+                    "INSERT INTO {lines_tbl} (header_id, seq, amount) \
+                     SELECT id, {seq}, {amount} \
+                     FROM {hdr_tbl} WHERE stage = {stage} ORDER BY id DESC LIMIT 1",
+                    amount = seq as i64 * 100,
+                ));
+            }
+            assert_ok(
+                &format!("13.6 stage {stage} sync"),
+                &["sync", "--config", cfg],
+            );
+        };
+
+        let hdr_iceberg = format!("{ns}.ts_headers_iceberg");
+        let lines_iceberg = format!("{ns}.ts_lines_iceberg");
+
+        with_sync_config(&cfg_yaml, |cfg| {
+            // Stage 1: 1 header, 3 lines
+            insert_and_sync(1, 3, 100, cfg);
+            assert_eq!(scan_row_count(&hdr_iceberg), 1, "stage 1: 1 header");
+            assert_eq!(scan_row_count(&lines_iceberg), 3, "stage 1: 3 lines");
+
+            // Stage 2: 1 more header, 2 lines
+            insert_and_sync(2, 2, 500, cfg);
+            assert_eq!(scan_row_count(&hdr_iceberg), 2, "stage 2: 2 headers");
+            assert_eq!(scan_row_count(&lines_iceberg), 5, "stage 2: 5 lines total");
+
+            // Stage 3: 1 more header, 5 lines
+            insert_and_sync(3, 5, 1000, cfg);
+            assert_eq!(scan_row_count(&hdr_iceberg), 3, "stage 3: 3 headers");
+            assert_eq!(
+                scan_row_count(&lines_iceberg),
+                10,
+                "stage 3: 10 lines total"
+            );
+
+            // The lines watermark must be set (driven by the JOIN's event_at).
+            let lines_wm = read_watermark(&lines_iceberg);
+            assert!(
+                !lines_wm.is_empty(),
+                "lines watermark must be set after stage 3"
+            );
         });
     }
 }

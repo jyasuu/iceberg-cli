@@ -165,7 +165,7 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         } else {
             params.insert(
                 "watermark".to_string(),
-                SqlValue::Timestamp(DateTime::from_timestamp(0, 0).unwrap_or_else(Utc::now)),
+                SqlValue::Timestamp(DateTime::UNIX_EPOCH),
             );
         }
 
@@ -222,7 +222,7 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
                             "[dry-run] would commit batch (skipped)"
                         );
                     } else {
-                        self.write_batch_atomic(job, rb, &new_watermark)
+                        self.write_batch_atomic(job, rb, &new_watermark, n)
                             .await
                             .with_context(|| {
                                 format!(
@@ -259,6 +259,7 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         job: &SyncJob,
         batch: RecordBatch,
         watermark: &Option<DateTime<Utc>>,
+        rows_written: usize,
     ) -> Result<()> {
         let ident = table_ident(&job.namespace, &job.table)?;
 
@@ -304,7 +305,8 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         writer.write(batch).await?;
         let data_files = writer.close().await?;
 
-        let meta_updates = build_metadata_updates(job.watermark_column.as_deref(), *watermark, 0);
+        let meta_updates =
+            build_metadata_updates(job.watermark_column.as_deref(), *watermark, rows_written);
 
         let tx = Transaction::new(&table);
 
