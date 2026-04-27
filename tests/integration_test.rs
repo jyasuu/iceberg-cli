@@ -2942,4 +2942,214 @@ sync_jobs:
         pg_exec(&format!("DROP TABLE IF EXISTS {events_pg}"));
         pg_exec(&format!("DROP TABLE IF EXISTS {snap_pg}"));
     }
+
+    // =========================================================================
+    // § 14.12  OVERWRITE with real Iceberg day() partition spec
+    //
+    // Creates a Postgres table with a DATE column.  Uses `iceberg_partition`
+    // (not legacy `partition_column`) so the Iceberg table is created with a
+    // real day() PartitionSpec.  Syncs two days of data, then overwrites only
+    // one day and asserts:
+    //   a) The overwritten day contains only the new rows.
+    //   b) The other day's rows are untouched (partition isolation).
+    //   c) The total row count is correct.
+    // =========================================================================
+
+    #[test]
+    fn t14_12_iceberg_partition_day_spec_overwrite_isolation() {
+        if !pg_reachable() {
+            eprintln!("SKIP t14_12: postgres not reachable");
+            return;
+        }
+        preflight();
+
+        let id = test_id("t14_12");
+        let pg_tbl = format!("ip_sales_{id}");
+        let ns = ws_ns(&id);
+        let iceberg_tbl = "ip_daily_sales";
+        let full = format!("{ns}.{iceberg_tbl}");
+
+        cli(&["create-namespace", "--namespace", &ns]);
+        pg_exec(&format!(
+            "CREATE TABLE {pg_tbl} ( \
+               id BIGSERIAL PRIMARY KEY, \
+               sale_date DATE NOT NULL, \
+               product TEXT NOT NULL, \
+               units INT NOT NULL \
+             )"
+        ));
+
+        // ── Run 1: insert rows for two different days ─────────────────────────
+        // Day A: 2024-03-01 — 3 rows
+        for i in 1i64..=3 {
+            pg_exec(&format!(
+                "INSERT INTO {pg_tbl} (sale_date, product, units) VALUES \
+                 ('2024-03-01', 'widget_{i}', {i}0)"
+            ));
+        }
+        // Day B: 2024-03-02 — 2 rows
+        for i in 1i64..=2 {
+            pg_exec(&format!(
+                "INSERT INTO {pg_tbl} (sale_date, product, units) VALUES \
+                 ('2024-03-02', 'gadget_{i}', {i}00)"
+            ));
+        }
+
+        // Sync with iceberg_partition (real PartitionSpec, day transform).
+        // We use mode: full and a WHERE to sync only Day A first.
+        let sql_day_a = format!(
+            "SELECT id, sale_date, product, units FROM {pg_tbl} WHERE sale_date = '2024-03-01'"
+        );
+        let extra = "watermark_column: ~\n    batch_size: 100\n    mode: full\n    write_mode: overwrite\n    iceberg_partition:\n      column: sale_date\n      transform: day";
+
+        with_sync_config(
+            &sync_cfg(&pg_tbl, &ns, iceberg_tbl, &sql_day_a, extra),
+            |cfg| {
+                assert_ok(
+                    "14.12 run1: sync Day A",
+                    &["sync", "--config", cfg, "--job", "ws_job"],
+                );
+                assert_eq!(
+                    scan_row_count(&full),
+                    3,
+                    "14.12 run1: 3 rows after syncing Day A"
+                );
+
+                // Now sync Day B into the same table (append path — different partition).
+                let sql_day_b = format!(
+                    "SELECT id, sale_date, product, units FROM {pg_tbl} WHERE sale_date = '2024-03-02'"
+                );
+                let cfg_b = sync_cfg(&pg_tbl, &ns, iceberg_tbl, &sql_day_b, extra);
+                with_sync_config(&cfg_b, |cfg2| {
+                    assert_ok(
+                        "14.12 run1b: sync Day B",
+                        &["sync", "--config", cfg2, "--job", "ws_job"],
+                    );
+                    assert_eq!(
+                        scan_row_count(&full),
+                        5,
+                        "14.12 after both days: 3+2=5 rows"
+                    );
+
+                    // ── Run 2: overwrite Day A only with fresh data (2 rows) ──────
+                    pg_exec(&format!(
+                        "DELETE FROM {pg_tbl} WHERE sale_date = '2024-03-01'"
+                    ));
+                    for i in 10i64..=11 {
+                        pg_exec(&format!(
+                            "INSERT INTO {pg_tbl} (sale_date, product, units) VALUES \
+                         ('2024-03-01', 'new_widget_{i}', {i})"
+                        ));
+                    }
+
+                    assert_ok(
+                        "14.12 run2: overwrite Day A with 2 new rows",
+                        &["sync", "--config", cfg, "--job", "ws_job"],
+                    );
+
+                    // Total: 2 (new Day A) + 2 (Day B unchanged) = 4
+                    assert_eq!(
+                        scan_row_count(&full),
+                        4,
+                        "14.12 run2: Day A replaced (2 new) + Day B untouched (2) = 4 total"
+                    );
+
+                    // Day B rows must still be visible.
+                    assert_output(
+                        "14.12 run2: Day B row still present",
+                        "gadget_1",
+                        &["scan", "--table", &full, "--limit", "99999"],
+                    );
+
+                    // New Day A rows must be present.
+                    assert_output(
+                        "14.12 run2: new Day A row present",
+                        "new_widget_10",
+                        &["scan", "--table", &full, "--limit", "99999"],
+                    );
+                });
+            },
+        );
+
+        pg_exec(&format!("DROP TABLE IF EXISTS {pg_tbl}"));
+    }
+
+    // =========================================================================
+    // § 14.13  OVERWRITE with iceberg_partition — first run creates table
+    //          with real PartitionSpec; second run preserves spec across COW
+    //
+    // Verifies that the drop+recreate cycle in the COW overwrite path does NOT
+    // lose the partition spec from the table metadata.
+    // =========================================================================
+
+    #[test]
+    fn t14_13_iceberg_partition_spec_survives_cow_recreate() {
+        if !pg_reachable() {
+            eprintln!("SKIP t14_13: postgres not reachable");
+            return;
+        }
+        preflight();
+
+        let id = test_id("t14_13");
+        let pg_tbl = format!("ip_snap_{id}");
+        let ns = ws_ns(&id);
+        let iceberg_tbl = "ip_snap";
+        let full = format!("{ns}.{iceberg_tbl}");
+
+        cli(&["create-namespace", "--namespace", &ns]);
+        pg_exec(&format!(
+            "CREATE TABLE {pg_tbl} ( \
+               id BIGSERIAL PRIMARY KEY, \
+               snap_date DATE NOT NULL, \
+               val INT NOT NULL \
+             )"
+        ));
+
+        let sql = format!("SELECT id, snap_date, val FROM {pg_tbl}");
+        let extra = "watermark_column: ~\n    batch_size: 100\n    mode: full\n    write_mode: overwrite\n    iceberg_partition:\n      column: snap_date\n      transform: day";
+
+        // Insert 3 rows for a single day.
+        for i in 1i64..=3 {
+            pg_exec(&format!(
+                "INSERT INTO {pg_tbl} (snap_date, val) VALUES ('2025-01-10', {i})"
+            ));
+        }
+
+        with_sync_config(&sync_cfg(&pg_tbl, &ns, iceberg_tbl, &sql, extra), |cfg| {
+            // Run 1: table created with partition spec.
+            assert_ok("14.13 run1", &["sync", "--config", cfg, "--job", "ws_job"]);
+            assert_eq!(scan_row_count(&full), 3, "14.13 run1: 3 rows");
+
+            // Run 2: overwrite triggers COW drop+recreate. Spec must be preserved.
+            pg_exec(&format!("DELETE FROM {pg_tbl}"));
+            for i in 10i64..=12 {
+                pg_exec(&format!(
+                    "INSERT INTO {pg_tbl} (snap_date, val) VALUES ('2025-01-10', {i})"
+                ));
+            }
+
+            assert_ok("14.13 run2", &["sync", "--config", cfg, "--job", "ws_job"]);
+            // Should be 3 (replacement), not 6 (duplicate append).
+            assert_eq!(
+                scan_row_count(&full),
+                3,
+                "14.13 run2: partition spec survived COW recreate — still 3 rows"
+            );
+
+            // Run 3: a third overwrite confirms the spec is durable across multiple cycles.
+            pg_exec(&format!("DELETE FROM {pg_tbl}"));
+            pg_exec(&format!(
+                "INSERT INTO {pg_tbl} (snap_date, val) VALUES ('2025-01-10', 999)"
+            ));
+
+            assert_ok("14.13 run3", &["sync", "--config", cfg, "--job", "ws_job"]);
+            assert_eq!(
+                scan_row_count(&full),
+                1,
+                "14.13 run3: spec still intact after two COW cycles — 1 row"
+            );
+        });
+
+        pg_exec(&format!("DROP TABLE IF EXISTS {pg_tbl}"));
+    }
 }
