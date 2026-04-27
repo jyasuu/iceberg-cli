@@ -6,12 +6,12 @@
 //!
 //! ## Strategy summary
 //!
-//! | Mode        | Reads existing files? | Produces delete files? | Cost    |
-//! |-------------|----------------------|------------------------|---------|
-//! | Append      | No                   | No                     | Low     |
-//! | Overwrite   | Yes (COW scan)       | No                     | Medium  |
-//! | Upsert      | Yes (COW scan)       | No                     | High    |
-//! | MergeInto   | Yes (COW scan)       | No                     | High    |
+//! | Mode        | Reads existing files?                              | Produces delete files? | Cost   |
+//! |-------------|---------------------------------------------------|------------------------|--------|
+//! | Append      | No                                                | No                     | Low    |
+//! | Overwrite   | Partition-scoped (real spec) / full scan (legacy) | No                     | Medium |
+//! | Upsert      | Yes (COW full scan)                               | No                     | High   |
+//! | MergeInto   | Yes (COW full scan)                               | No                     | High   |
 //!
 //! ## iceberg-rust 0.9 Transaction API constraints
 //!
@@ -48,7 +48,8 @@ use arrow_array::{RecordBatch, StringArray};
 use arrow_schema::DataType;
 use futures::TryStreamExt;
 use iceberg::{
-    spec::{DataFile, DataFileFormat, SchemaRef},
+    expr::Reference,
+    spec::{DataFile, DataFileFormat, Datum, SchemaRef},
     table::Table,
     transaction::{ApplyTransactionAction, Transaction},
     writer::{
@@ -109,6 +110,16 @@ pub async fn plan_append(job: &SyncJob, table: &Table, batch: RecordBatch) -> Re
 /// Partition overwrite: replace all existing rows for the partition value(s)
 /// present in the incoming batch with the new batch (copy-on-write).
 ///
+/// ## Partition column resolution
+///
+/// The column used to identify which rows belong to the overwritten partition
+/// is resolved in priority order:
+///
+/// 1. `job.iceberg_partition.column` — preferred; the table has a real Iceberg
+///    partition spec using a day/month/year/hour transform.
+/// 2. `job.partition_column` — legacy fallback; used as a plain string equality
+///    filter with no native Iceberg partition spec on the table.
+///
 /// ## Implementation (COW)
 ///
 /// 1. Scan all existing rows from the current Iceberg snapshot.
@@ -121,10 +132,17 @@ pub async fn plan_append(job: &SyncJob, table: &Table, batch: RecordBatch) -> Re
 /// On first run (no existing snapshot) the behaviour is identical to a plain
 /// append, since there is nothing to scan.
 pub async fn plan_overwrite(job: &SyncJob, table: &Table, batch: RecordBatch) -> Result<WritePlan> {
-    let part_col = job
-        .partition_column
-        .as_deref()
-        .expect("partition_column required for overwrite — validated at config load");
+    // Resolve partition column: prefer iceberg_partition.column, fall back to
+    // the legacy partition_column field.  Config validation guarantees at least
+    // one is set for write_mode=overwrite.
+    let part_col: &str = job
+        .iceberg_partition
+        .as_ref()
+        .map(|ip| ip.column.as_str())
+        .or(job.partition_column.as_deref())
+        .expect(
+            "overwrite requires iceberg_partition or partition_column — validated at config load",
+        );
 
     let n = batch.num_rows();
 
@@ -132,33 +150,89 @@ pub async fn plan_overwrite(job: &SyncJob, table: &Table, batch: RecordBatch) ->
     let incoming_parts = extract_string_column_values(&batch, part_col)
         .context("Overwrite: failed to extract incoming partition values")?;
 
+    // Does the table have a real Iceberg partition spec (non-empty fields)?
+    // When true, we can use a predicate-pushdown scan scoped to only the
+    // relevant day/month/year bucket — far cheaper than a full table scan.
+    let has_real_spec = !table
+        .metadata()
+        .default_partition_spec()
+        .fields()
+        .is_empty();
+
     // If the table has no snapshot yet this is the first run — plain append.
     let merged = if table.metadata().current_snapshot().is_some() {
-        let existing = scan_table_to_batches(table)
-            .await
-            .context("Overwrite: failed to scan existing table data")?;
+        if has_real_spec {
+            // Fast path: scan only files in the target partition bucket.
+            // The Iceberg manifest evaluator prunes all other data files at
+            // the manifest level — no row-level filter needed.
+            //
+            // Partition field name convention: "<column>_<transform>"
+            // e.g. "sale_date_day" for transform=day on column sale_date.
+            let partition_field_name = job
+                .iceberg_partition
+                .as_ref()
+                .map(|ip| format!("{}_{}", ip.column, ip.transform))
+                .unwrap_or_else(|| format!("{part_col}_day"));
 
-        // Keep existing rows whose partition value is NOT in the incoming set.
-        let mut survivors: Vec<RecordBatch> = Vec::new();
-        let mut rows_removed = 0usize;
-        for existing_batch in existing {
-            let (kept, dropped) = partition_filter(&existing_batch, part_col, &incoming_parts)
-                .context("Overwrite: failed to filter existing rows by partition")?;
-            rows_removed += dropped;
-            if let Some(kept_batch) = kept {
-                survivors.push(kept_batch);
+            let existing =
+                scan_table_for_partition_values(table, &partition_field_name, &incoming_parts)
+                    .await
+                    .context("Overwrite: partition-scoped scan failed")?;
+
+            let rows_scanned: usize = existing
+                .iter()
+                .map(|b| b.num_rows())
+                .collect::<Vec<_>>()
+                .iter()
+                .sum();
+            info!(
+                job = %job.name,
+                partition_field = %partition_field_name,
+                rows_scanned,
+                rows_incoming = n,
+                "overwrite: partition-scoped scan (real spec) — replacing partition data"
+            );
+
+            // All rows returned by the scoped scan belong to the target
+            // partition and are fully replaced by the incoming batch.
+            // No row-level filter needed — just prepend existing (empty on
+            // first overwrite of this partition) then push new batch.
+            let mut all = existing;
+            all.push(batch);
+            if all.len() == 1 {
+                all.remove(0)
+            } else {
+                concat_batches_list(&all)
+                    .context("Overwrite: failed to concatenate partition-scoped batches")?
             }
+        } else {
+            // Legacy COW path: full table scan + row-level partition filter.
+            // Used when the table was created without a real partition spec
+            // (i.e. using the legacy partition_column field).
+            let existing = scan_table_to_batches(table)
+                .await
+                .context("Overwrite: failed to scan existing table data")?;
+
+            let mut survivors: Vec<RecordBatch> = Vec::new();
+            let mut rows_removed = 0usize;
+            for existing_batch in existing {
+                let (kept, dropped) = partition_filter(&existing_batch, part_col, &incoming_parts)
+                    .context("Overwrite: failed to filter existing rows by partition")?;
+                rows_removed += dropped;
+                if let Some(kept_batch) = kept {
+                    survivors.push(kept_batch);
+                }
+            }
+            info!(
+                job = %job.name,
+                partition_col = part_col,
+                rows_removed,
+                rows_incoming = n,
+                "overwrite: legacy COW — removed old partition rows, merging with incoming"
+            );
+            survivors.push(batch);
+            concat_batches_list(&survivors).context("Overwrite: failed to concatenate batches")?
         }
-        info!(
-            job = %job.name,
-            partition_col = part_col,
-            rows_removed,
-            rows_incoming = n,
-            "overwrite: COW — removed old partition rows, merging with incoming"
-        );
-        // Append incoming batch at the end.
-        survivors.push(batch);
-        concat_batches_list(&survivors).context("Overwrite: failed to concatenate batches")?
     } else {
         debug!(job = %job.name, "overwrite: no existing snapshot — first run, plain append");
         batch
@@ -459,6 +533,66 @@ async fn scan_table_to_batches(table: &Table) -> Result<Vec<RecordBatch>> {
         .try_collect()
         .await
         .context("COW scan: failed to collect Arrow batches")?;
+
+    Ok(batches)
+}
+
+/// Scan only the Parquet files that belong to the given partition values.
+///
+/// Uses an Iceberg `is_in` predicate on the **partition field name** (e.g.
+/// `sale_date_day`) so the manifest evaluator prunes unrelated data files at
+/// the manifest level — no Arrow row-filter needed afterwards.
+///
+/// The `partition_field_name` must be the Iceberg partition field name
+/// (i.e. `<column>_<transform>`, e.g. `sale_date_day`), not the raw source
+/// column name.
+///
+/// Returns an empty `Vec` if the table has no snapshot (first run).
+async fn scan_table_for_partition_values(
+    table: &Table,
+    partition_field_name: &str,
+    string_values: &std::collections::HashSet<String>,
+) -> Result<Vec<RecordBatch>> {
+    if string_values.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Build Datum::date values from the string set.  The day() transform
+    // produces i32 days-since-epoch values; the manifest evaluator compares
+    // against them when pruning.  We parse each string as a date and convert.
+    let datums: Vec<Datum> = string_values
+        .iter()
+        .filter_map(|s| Datum::date_from_str(s).ok())
+        .collect();
+
+    // If none of the values parse as dates (e.g. we're on the legacy
+    // string-equality partition_column path), fall back to string datums.
+    let datums = if datums.is_empty() {
+        string_values
+            .iter()
+            .map(|s| Datum::string(s.clone()))
+            .collect()
+    } else {
+        datums
+    };
+
+    let predicate = Reference::new(partition_field_name).is_in(datums);
+
+    let scan = table
+        .scan()
+        .with_filter(predicate)
+        .build()
+        .context("partition-scoped scan: failed to build")?;
+
+    let stream = scan
+        .to_arrow()
+        .await
+        .context("partition-scoped scan: failed to open Arrow stream")?;
+
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .context("partition-scoped scan: failed to collect batches")?;
 
     Ok(batches)
 }

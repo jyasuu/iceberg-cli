@@ -189,7 +189,15 @@ sync_jobs:
     table:       daily_sales_summary
     group:       overwrite_examples
     write_mode:  overwrite
-    partition_column: sale_date   # all rows in batch share the same sale_date
+    # True Iceberg day-transform partition spec.
+    # The table is created with day(sale_date) so each Parquet file lands in its
+    # own  sale_date_day=<YYYY-MM-DD>/  directory and readers can prune by day
+    # without scanning other partitions.
+    iceberg_partition:
+      column:    sale_date
+      transform: day
+    # partition_column is kept for backward compatibility but superseded above.
+    # partition_column: sale_date
     mode:        full
     sql: |
       SELECT

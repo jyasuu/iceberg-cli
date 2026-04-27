@@ -91,8 +91,8 @@ impl SyncConfig {
             // ── Write-mode constraints ──────────────────────────────────────
             match &job.write_mode {
                 WriteMode::Overwrite => anyhow::ensure!(
-                    job.partition_column.is_some(),
-                    "Job '{}': write_mode=overwrite requires partition_column to be set",
+                    job.partition_column.is_some() || job.iceberg_partition.is_some(),
+                    "Job '{}': write_mode=overwrite requires either partition_column or iceberg_partition to be set",
                     job.name
                 ),
                 WriteMode::Upsert | WriteMode::MergeInto => {
@@ -328,6 +328,54 @@ pub enum WriteMode {
     MergeInto,
 }
 
+// ── Iceberg partition config ──────────────────────────────────────────────────
+
+/// True Iceberg partition spec attached to the table at creation time.
+///
+/// When set on an `overwrite` job, the table is created with a native
+/// `day(column)` (or `month` / `year` / `hour`) transform rather than using
+/// `partition_column` as a row-level filter.  This enables:
+///
+/// - **Scan pruning** — readers skip files outside the queried partition.
+/// - **Atomic per-day overwrite** — only files in matching day-buckets are
+///   replaced; other partitions are never touched.
+/// - **Correct manifest layout** — each Parquet file lands in its own
+///   `<column>_<transform>=<value>/` directory.
+///
+/// The field names in the `UnboundPartitionSpec` sent to the catalog follow
+/// the convention `<column>_<transform>` (e.g. `sale_date_day`).
+///
+/// ## Supported transforms
+///
+/// | `transform` value | Iceberg transform | Source type            |
+/// |-------------------|-------------------|------------------------|
+/// | `"day"`  (default)| `day(col)`        | Timestamp / Date       |
+/// | `"month"`         | `month(col)`      | Timestamp / Date       |
+/// | `"year"`          | `year(col)`       | Timestamp / Date       |
+/// | `"hour"`          | `hour(col)`       | Timestamp only         |
+///
+/// ## Compatibility with `partition_column`
+///
+/// `partition_column` is still accepted for backward compatibility and drives
+/// the legacy COW row-filter path.  When `iceberg_partition` is present it
+/// takes precedence: the table is created with a real partition spec, and the
+/// overwrite plan uses the partition values from `iceberg_partition.column`
+/// rather than `partition_column`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IcebergPartitionConfig {
+    /// Name of the source column to partition on.
+    /// Must exist in the SQL result set and resolve to an Iceberg field.
+    pub column: String,
+
+    /// Temporal transform to apply.  Defaults to `"day"`.
+    #[serde(default = "default_partition_transform")]
+    pub transform: String,
+}
+
+fn default_partition_transform() -> String {
+    "day".to_string()
+}
+
 // ── Merge config ──────────────────────────────────────────────────────────────
 
 /// Configuration for [`WriteMode::Upsert`] and [`WriteMode::MergeInto`].
@@ -390,9 +438,25 @@ pub struct SyncJob {
     #[serde(default)]
     pub write_mode: WriteMode,
 
-    /// Partition column for `write_mode: overwrite`.
-    /// The engine replaces all existing data files in this partition.
+    /// Partition column for `write_mode: overwrite` (legacy row-filter path).
+    ///
+    /// When `iceberg_partition` is also set, this field is superseded.
+    /// Kept for backward compatibility; new jobs should use `iceberg_partition`.
     pub partition_column: Option<String>,
+
+    /// True Iceberg partition spec for `write_mode: overwrite`.
+    ///
+    /// When set, the table is created (or recreated after COW) with a real
+    /// `UnboundPartitionSpec` using the specified temporal transform.  This
+    /// enables scan pruning and correct per-partition atomic overwrite.
+    ///
+    /// Example YAML:
+    /// ```yaml
+    /// iceberg_partition:
+    ///   column: sale_date
+    ///   transform: day   # default; can be month / year / hour
+    /// ```
+    pub iceberg_partition: Option<IcebergPartitionConfig>,
 
     /// Merge config for `write_mode: upsert` and `write_mode: merge_into`.
     pub merge: Option<MergeConfig>,
@@ -495,11 +559,12 @@ sync_jobs:
     // ── Overwrite ────────────────────────────────────────────────────────────
 
     #[test]
-    fn overwrite_requires_partition_column() {
+    fn overwrite_requires_partition_column_or_iceberg_partition() {
         let err = parse(&minimal_config("write_mode: overwrite")).unwrap_err();
         assert!(
-            err.to_string().contains("partition_column"),
-            "expected partition_column error, got: {err}"
+            err.to_string().contains("partition_column")
+                || err.to_string().contains("iceberg_partition"),
+            "expected partition_column or iceberg_partition error, got: {err}"
         );
     }
 
@@ -516,8 +581,39 @@ sync_jobs:
         );
     }
 
-    // ── Upsert ───────────────────────────────────────────────────────────────
+    #[test]
+    fn overwrite_with_iceberg_partition_is_valid() {
+        let cfg = parse(&minimal_config(
+            "write_mode: overwrite\niceberg_partition:\n  column: sale_date\n  transform: day",
+        ))
+        .unwrap();
+        assert_eq!(cfg.sync_jobs[0].write_mode, WriteMode::Overwrite);
+        let ip = cfg.sync_jobs[0].iceberg_partition.as_ref().unwrap();
+        assert_eq!(ip.column, "sale_date");
+        assert_eq!(ip.transform, "day");
+    }
 
+    #[test]
+    fn iceberg_partition_transform_defaults_to_day() {
+        let cfg = parse(&minimal_config(
+            "write_mode: overwrite\niceberg_partition:\n  column: created_at",
+        ))
+        .unwrap();
+        let ip = cfg.sync_jobs[0].iceberg_partition.as_ref().unwrap();
+        assert_eq!(ip.transform, "day");
+    }
+
+    #[test]
+    fn iceberg_partition_month_transform_is_valid() {
+        let cfg = parse(&minimal_config(
+            "write_mode: overwrite\niceberg_partition:\n  column: event_ts\n  transform: month",
+        ))
+        .unwrap();
+        let ip = cfg.sync_jobs[0].iceberg_partition.as_ref().unwrap();
+        assert_eq!(ip.transform, "month");
+    }
+
+    // ── Upsert ───────────────────────────────────────────────────────────────
     #[test]
     fn upsert_requires_merge_block() {
         let err = parse(&minimal_config("write_mode: upsert")).unwrap_err();

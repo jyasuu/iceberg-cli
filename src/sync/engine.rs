@@ -56,13 +56,23 @@ use iceberg::{
         NestedField,
         PrimitiveType,
         Schema as IcebergSchema,
+        Transform,
         Type,
+        UnboundPartitionField,
+        UnboundPartitionSpec,
     },
     transaction::{ApplyTransactionAction, Transaction},
 };
 use tracing::{info, warn};
 
-use crate::config::{RetryConfig, SchemaEvolutionConfig, SyncJob, SyncMode, WriteMode};
+use crate::config::{
+    // IcebergPartitionConfig,
+    RetryConfig,
+    SchemaEvolutionConfig,
+    SyncJob,
+    SyncMode,
+    WriteMode,
+};
 use crate::sync::{
     // file_name::ProductionFileNameGenerator,
     metadata::{RunSummary, build_metadata_updates, read_watermark},
@@ -298,7 +308,7 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
             batch.clone()
         };
 
-        self.ensure_table(&ident, &batch_for_schema).await?;
+        self.ensure_table(&ident, &batch_for_schema, job).await?;
         if job.schema_evolution.allow_add_columns {
             self.evolve_schema(&ident, &batch_for_schema, &job.schema_evolution)
                 .await?;
@@ -366,6 +376,27 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
 
+            // Preserve the existing partition spec so it survives the
+            // drop+recreate cycle.  On the very first run the spec is
+            // unpartitioned (empty fields) and we fall back to building one
+            // from the job's `iceberg_partition` config if present.
+            let existing_spec = table.metadata().default_partition_spec();
+            let preserved_spec: Option<UnboundPartitionSpec> = if !existing_spec.fields().is_empty()
+            {
+                // Table already has a real partition spec — convert back to
+                // unbound so TableCreation can accept it.  The
+                // `From<PartitionSpec> for UnboundPartitionSpec` impl
+                // retains source_id, name, and transform for each field
+                // while setting field_id to None (catalog re-assigns).
+                let unbound: UnboundPartitionSpec = existing_spec.as_ref().clone().into();
+                Some(unbound)
+            } else {
+                // No existing spec — build one from job config if available.
+                job.iceberg_partition.as_ref().and_then(|ip| {
+                    build_partition_spec(&preserved_schema, &ip.column, &ip.transform).ok()
+                })
+            };
+
             // Drop the stale table.
             self.catalog
                 .drop_table(&ident)
@@ -376,11 +407,16 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
             // ensure_table, which takes a RecordBatch for schema inference.
             // We recreate the table directly to preserve the exact Iceberg
             // schema (including field IDs) rather than re-inferring from Arrow.
-            let creation = TableCreation::builder()
+            let builder = TableCreation::builder()
                 .name(ident.name().to_string())
                 .schema((*preserved_schema).clone())
-                .properties(existing_props)
-                .build();
+                .properties(existing_props);
+
+            let creation = if let Some(spec) = preserved_spec {
+                builder.partition_spec(spec).build()
+            } else {
+                builder.build()
+            };
             let ns = ident.namespace();
             self.catalog
                 .create_table(ns, creation)
@@ -461,7 +497,12 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
 
     // ── Table auto-creation ───────────────────────────────────────────────────
 
-    async fn ensure_table(&self, ident: &TableIdent, batch: &RecordBatch) -> Result<()> {
+    async fn ensure_table(
+        &self,
+        ident: &TableIdent,
+        batch: &RecordBatch,
+        job: &SyncJob,
+    ) -> Result<()> {
         if self.catalog.table_exists(ident).await? {
             return Ok(());
         }
@@ -474,10 +515,45 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         }
 
         let schema = arrow_schema_to_iceberg(batch.schema_ref())?;
-        let creation = TableCreation::builder()
+        // Attach a real Iceberg partition spec when `iceberg_partition` is set.
+        // This ensures the table is created with a native day/month/year/hour
+        // transform rather than being left unpartitioned and relying on the
+        // legacy `partition_column` row-filter path.
+        let resolved_spec =
+            job.iceberg_partition.as_ref().and_then(|ip| {
+                match build_partition_spec(&schema, &ip.column, &ip.transform) {
+                    Ok(spec) => {
+                        tracing::info!(
+                            table = %ident,
+                            column = %ip.column,
+                            transform = %ip.transform,
+                            "Attaching Iceberg partition spec to new table"
+                        );
+                        Some(spec)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            table = %ident,
+                            column = %ip.column,
+                            error = %e,
+                            "Failed to build partition spec; creating table unpartitioned"
+                        );
+                        None
+                    }
+                }
+            });
+
+        // 2. Set up the base builder
+        let builder = TableCreation::builder()
             .name(ident.name().to_string())
-            .schema(schema)
-            .build();
+            .schema(schema.clone());
+
+        // 3. Build it based on whether we successfully resolved a spec
+        let creation = if let Some(spec) = resolved_spec {
+            builder.partition_spec(spec).build()
+        } else {
+            builder.build()
+        };
         self.catalog.create_table(ns, creation).await?;
         Ok(())
     }
@@ -521,6 +597,77 @@ fn table_ident(namespace: &str, table: &str) -> Result<TableIdent> {
     let ns = NamespaceIdent::from_strs(namespace.split('.').collect::<Vec<_>>())
         .map_err(|e| anyhow::anyhow!("Invalid namespace '{namespace}': {e}"))?;
     Ok(TableIdent::new(ns, table.to_string()))
+}
+
+// ── Partition spec builder ────────────────────────────────────────────────────
+
+/// Build an [`UnboundPartitionSpec`] for a single temporal column.
+///
+/// Resolves the column name to its Iceberg field ID, selects the appropriate
+/// [`Transform`], and returns the spec ready to pass to [`TableCreation`].
+///
+/// ## Supported transforms
+///
+/// | `transform_str` | [`Transform`] variant |
+/// |-----------------|----------------------|
+/// | `"day"`         | `Transform::Day`     |
+/// | `"month"`       | `Transform::Month`   |
+/// | `"year"`        | `Transform::Year`    |
+/// | `"hour"`        | `Transform::Hour`    |
+///
+/// ## Errors
+///
+/// Returns an error if `column` is not present in `schema` or if
+/// `transform_str` is not one of the supported values.
+pub(crate) fn build_partition_spec(
+    schema: &IcebergSchema,
+    column: &str,
+    transform_str: &str,
+) -> Result<UnboundPartitionSpec> {
+    // Resolve the column name to its Iceberg field ID.
+    let field = schema.as_struct().field_by_name(column).ok_or_else(|| {
+        anyhow::anyhow!(
+            "iceberg_partition: column '{}' not found in schema \
+                 (available: {})",
+            column,
+            schema
+                .as_struct()
+                .fields()
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    let source_id = field.id;
+
+    let transform = match transform_str {
+        "day" => Transform::Day,
+        "month" => Transform::Month,
+        "year" => Transform::Year,
+        "hour" => Transform::Hour,
+        other => anyhow::bail!(
+            "iceberg_partition: unsupported transform '{}'; \
+             valid values are: day, month, year, hour",
+            other
+        ),
+    };
+
+    // Partition field name convention: "<column>_<transform>"
+    // e.g. "sale_date_day", "event_ts_month".
+    let field_name = format!("{column}_{transform_str}");
+
+    let spec = UnboundPartitionSpec::builder()
+        .add_partition_fields(vec![UnboundPartitionField {
+            source_id,
+            field_id: None, // assigned by the catalog
+            name: field_name,
+            transform,
+        }])
+        .context("Failed to build UnboundPartitionSpec")?
+        .build();
+
+    Ok(spec)
 }
 
 #[allow(dead_code)]
@@ -740,6 +887,7 @@ mod tests {
             retry: None,
             write_mode: WriteMode::Append,
             partition_column: None,
+            iceberg_partition: None,
             merge: None,
         }
     }
@@ -1009,6 +1157,139 @@ mod tests {
         assert!(
             inject_field_ids(batch, &iceberg_schema).is_err(),
             "should error when column has no Iceberg field"
+        );
+    }
+
+    // ── build_partition_spec ─────────────────────────────────────────────────
+
+    fn schema_with_fields(fields: Vec<(&str, arrow_schema::DataType)>) -> IcebergSchema {
+        use arrow_schema::{Field, Schema};
+        let arrow = Schema::new(
+            fields
+                .into_iter()
+                .map(|(name, dt)| Field::new(name, dt, true))
+                .collect::<Vec<_>>(),
+        );
+        arrow_schema_to_iceberg(&arrow).unwrap()
+    }
+
+    #[test]
+    fn partition_spec_day_on_date_column() {
+        use arrow_schema::DataType;
+        let schema = schema_with_fields(vec![
+            ("id", DataType::Int64),
+            ("sale_date", DataType::Date32),
+            ("amount", DataType::Float64),
+        ]);
+
+        let spec = build_partition_spec(&schema, "sale_date", "day").unwrap();
+        let fields = spec.fields();
+
+        assert_eq!(fields.len(), 1, "one partition field");
+        assert_eq!(fields[0].name, "sale_date_day");
+        assert_eq!(fields[0].source_id, 2, "sale_date is field id 2 (1-based)");
+        assert!(
+            matches!(fields[0].transform, Transform::Day),
+            "transform should be Day, got {:?}",
+            fields[0].transform
+        );
+    }
+
+    #[test]
+    fn partition_spec_month_on_timestamp_column() {
+        use arrow_schema::{DataType, TimeUnit};
+        let schema = schema_with_fields(vec![
+            ("event_ts", DataType::Timestamp(TimeUnit::Microsecond, None)),
+            ("user_id", DataType::Int64),
+        ]);
+
+        let spec = build_partition_spec(&schema, "event_ts", "month").unwrap();
+        let fields = spec.fields();
+
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "event_ts_month");
+        assert_eq!(fields[0].source_id, 1, "event_ts is field id 1");
+        assert!(matches!(fields[0].transform, Transform::Month));
+    }
+
+    #[test]
+    fn partition_spec_year_on_timestamptz_column() {
+        use arrow_schema::{DataType, TimeUnit};
+        let schema = schema_with_fields(vec![(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        )]);
+
+        let spec = build_partition_spec(&schema, "created_at", "year").unwrap();
+        assert_eq!(spec.fields()[0].name, "created_at_year");
+        assert!(matches!(spec.fields()[0].transform, Transform::Year));
+    }
+
+    #[test]
+    fn partition_spec_hour_transform() {
+        use arrow_schema::{DataType, TimeUnit};
+        let schema = schema_with_fields(vec![(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        )]);
+
+        let spec = build_partition_spec(&schema, "ts", "hour").unwrap();
+        assert_eq!(spec.fields()[0].name, "ts_hour");
+        assert!(matches!(spec.fields()[0].transform, Transform::Hour));
+    }
+
+    #[test]
+    fn partition_spec_field_id_is_correct_for_third_column() {
+        // Ensures source_id = positional field ID (1-based from arrow_schema_to_iceberg)
+        use arrow_schema::DataType;
+        let schema = schema_with_fields(vec![
+            ("a", DataType::Int64),
+            ("b", DataType::Utf8),
+            ("event_date", DataType::Date32),
+            ("d", DataType::Float64),
+        ]);
+
+        let spec = build_partition_spec(&schema, "event_date", "day").unwrap();
+        assert_eq!(
+            spec.fields()[0].source_id,
+            3,
+            "event_date is the 3rd field, so source_id should be 3"
+        );
+    }
+
+    #[test]
+    fn partition_spec_error_on_missing_column() {
+        use arrow_schema::DataType;
+        let schema = schema_with_fields(vec![("id", DataType::Int64)]);
+        let err = build_partition_spec(&schema, "nonexistent", "day").unwrap_err();
+        assert!(
+            err.to_string().contains("nonexistent"),
+            "error should name the missing column: {err}"
+        );
+    }
+
+    #[test]
+    fn partition_spec_error_on_unsupported_transform() {
+        use arrow_schema::DataType;
+        let schema = schema_with_fields(vec![("dt", DataType::Date32)]);
+        let err = build_partition_spec(&schema, "dt", "bucket").unwrap_err();
+        assert!(
+            err.to_string().contains("bucket"),
+            "error should name the bad transform: {err}"
+        );
+    }
+
+    #[test]
+    fn partition_spec_field_name_convention() {
+        // Field name must be "<column>_<transform>" for the partition-scoped
+        // scan to find it correctly via Reference::new(partition_field_name).
+        use arrow_schema::DataType;
+        let schema = schema_with_fields(vec![("order_date", DataType::Date32)]);
+        let spec = build_partition_spec(&schema, "order_date", "month").unwrap();
+        assert_eq!(
+            spec.fields()[0].name,
+            "order_date_month",
+            "partition field name must follow <column>_<transform> convention"
         );
     }
 }
