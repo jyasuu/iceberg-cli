@@ -24,6 +24,7 @@ comfy-table = "7"
 serde_json  = "1"
 
 # Arrow / Parquet
+arrow  = "57.1"
 arrow-array  = "57.1"
 arrow-schema = "57.1"
 arrow-cast   = "57.1"

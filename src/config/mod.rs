@@ -17,31 +17,21 @@
 //! across-run resumption.
 //!
 //! ### Retry config (`retry`)
-//! Global or per-job exponential-backoff retry:
-//! ```yaml
-//! retry:
-//!   max_attempts: 3
-//!   initial_delay_ms: 500
-//!   backoff_multiplier: 2.0
-//! ```
+//! Global or per-job exponential-backoff retry.
 //!
 //! ### Schema evolution (`schema_evolution`)
 //! With `allow_add_columns: true`, new columns in the source are appended to
 //! the Iceberg table automatically.
 //!
-//! ### Dry-run (`--dry-run` CLI flag)
-//! Logs what the engine *would* do without writing any data.
+//! ### Write modes (`write_mode`)
+//! Controls how each batch is committed to the Iceberg table:
 //!
-//! ### Parallel execution (`parallel`)
-//! Independent jobs (no shared dependency chain) run concurrently up to
-//! `parallel` workers (default 1).
-//!
-//! ### Dead-letter queue (`dead_letter_exchange`)
-//! RabbitMQ bindings can specify a DLX for nacked messages.
-//!
-//! ### Job groups (`group`)
-//! Tag jobs with a group name to run just that cohort:
-//! `iceberg-cli sync --group orders_pipeline`
+//! | Mode        | Iceberg behaviour                              | Typical use-case              |
+//! |-------------|------------------------------------------------|-------------------------------|
+//! | `append`    | `fast_append` — only adds new data files       | Events, logs, immutable CDC   |
+//! | `overwrite` | Replace-files by partition                     | Full-refresh dimensions        |
+//! | `upsert`    | Position-delete matching rows, append new rows | PK-keyed CDC updates           |
+//! | `merge_into`| Route rows by `_op` column (I / U / D)         | Full MERGE semantics from CDC  |
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -53,7 +43,6 @@ pub struct SyncConfig {
     pub sources: HashMap<String, SourceConfig>,
     pub destinations: HashMap<String, DestinationConfig>,
     pub sync_jobs: Vec<SyncJob>,
-    /// Global retry policy — can be overridden per job.
     #[serde(default)]
     pub retry: RetryConfig,
     #[serde(default)]
@@ -98,6 +87,30 @@ impl SyncConfig {
                     job.name
                 );
             }
+
+            // ── Write-mode constraints ──────────────────────────────────────
+            match &job.write_mode {
+                WriteMode::Overwrite => anyhow::ensure!(
+                    job.partition_column.is_some(),
+                    "Job '{}': write_mode=overwrite requires partition_column to be set",
+                    job.name
+                ),
+                WriteMode::Upsert | WriteMode::MergeInto => {
+                    let merge = job.merge.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Job '{}': write_mode={:?} requires a 'merge' block with key_columns",
+                            job.name,
+                            job.write_mode
+                        )
+                    })?;
+                    anyhow::ensure!(
+                        !merge.key_columns.is_empty(),
+                        "Job '{}': merge.key_columns must not be empty",
+                        job.name
+                    );
+                }
+                WriteMode::Append => {}
+            }
         }
         self.detect_cycles()?;
         Ok(())
@@ -139,7 +152,6 @@ impl SyncConfig {
         Ok(())
     }
 
-    /// Jobs sorted so dependencies run before dependents (topological).
     pub fn ordered_jobs(&self) -> anyhow::Result<Vec<&SyncJob>> {
         let mut result: Vec<&SyncJob> = Vec::new();
         let mut visited: std::collections::HashSet<&str> = Default::default();
@@ -171,7 +183,6 @@ impl SyncConfig {
         Ok(result)
     }
 
-    /// Jobs filtered by group name, topologically ordered.
     #[allow(dead_code)]
     pub fn ordered_jobs_for_group<'a>(&'a self, group: &str) -> anyhow::Result<Vec<&'a SyncJob>> {
         let all = self.ordered_jobs()?;
@@ -181,7 +192,6 @@ impl SyncConfig {
             .collect())
     }
 
-    /// Effective retry policy for a job (job-level overrides global).
     pub fn retry_for(&self, job: &SyncJob) -> RetryConfig {
         job.retry.clone().unwrap_or_else(|| self.retry.clone())
     }
@@ -228,13 +238,10 @@ fn default_catalog_name() -> String {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RetryConfig {
-    /// Total attempts including the first (1 = no retry).
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
-    /// Delay before first retry in milliseconds.
     #[serde(default = "default_initial_delay_ms")]
     pub initial_delay_ms: u64,
-    /// Backoff multiplier applied after each failure (1.0 = constant delay).
     #[serde(default = "default_backoff_multiplier")]
     pub backoff_multiplier: f64,
 }
@@ -263,10 +270,84 @@ fn default_backoff_multiplier() -> f64 {
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct SchemaEvolutionConfig {
-    /// When true, columns present in the source but absent from the Iceberg
-    /// table are appended automatically.  Removed columns are left nullable.
     #[serde(default)]
     pub allow_add_columns: bool,
+}
+
+// ── Write mode ────────────────────────────────────────────────────────────────
+
+/// How the engine commits each batch to the Iceberg table.
+///
+/// ## Choosing the right mode
+///
+/// ```text
+/// Source produces only new rows?           → append   (default, fastest)
+/// Daily full-refresh of a partition?       → overwrite
+/// CDC stream with row updates (PK-keyed)?  → upsert
+/// CDC stream with I/U/D in _op column?     → merge_into
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteMode {
+    /// Only add new data files. Never touches existing files. (default)
+    ///
+    /// Uses Iceberg `fast_append`. Produces one new data file per batch.
+    /// Cheapest operation — no read-before-write.
+    #[default]
+    Append,
+
+    /// Drop and replace the matching partition(s) before writing new rows.
+    ///
+    /// Requires `partition_column`. Uses Iceberg `replace_data_files`.
+    /// Old data files in the matched partition are marked as deleted in the
+    /// same snapshot that adds the new ones — atomic from a reader's view.
+    ///
+    /// Suitable for full-refresh dimension tables or daily snapshot partitions.
+    Overwrite,
+
+    /// Match existing rows by `merge.key_columns` using position deletes,
+    /// then append all rows from the source batch.
+    ///
+    /// Produces position-delete files plus a new data file per batch.
+    /// Requires periodic compaction (`REWRITE_DATA_FILES + EXPIRE_SNAPSHOTS`).
+    ///
+    /// Suitable for CDC streams that emit the full updated row without an
+    /// explicit operation-type column.
+    Upsert,
+
+    /// Route rows by the `_op` column value:
+    ///   - `'I'` (insert)  → append to a new data file
+    ///   - `'U'` (update)  → position-delete the old row, append new row
+    ///   - `'D'` (delete)  → position-delete only (no new row appended)
+    ///
+    /// Requires `merge.key_columns`. Produces position-delete files for U/D
+    /// rows and data files for I/U rows.
+    ///
+    /// Suitable for Debezium, pglogical, or similar CDC sources that emit the
+    /// operation type as a column.
+    MergeInto,
+}
+
+// ── Merge config ──────────────────────────────────────────────────────────────
+
+/// Configuration for [`WriteMode::Upsert`] and [`WriteMode::MergeInto`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MergeConfig {
+    /// Column(s) that uniquely identify a logical row in the target table.
+    ///
+    /// Used to locate existing Iceberg rows that must be position-deleted
+    /// before the incoming row is appended.
+    ///
+    /// Typically the primary key: `[id]` or composite `[tenant_id, user_id]`.
+    pub key_columns: Vec<String>,
+
+    /// When `true`, deletes are permanent within the active snapshot.
+    /// When `false` (default), deleted rows remain in historical snapshots.
+    ///
+    /// Set `true` for GDPR right-to-erasure workflows, then run
+    /// `EXPIRE_SNAPSHOTS` to physically purge the old data files.
+    #[serde(default)]
+    pub hard_delete: bool,
 }
 
 // ── Sync job ──────────────────────────────────────────────────────────────────
@@ -279,31 +360,17 @@ pub struct SyncJob {
     pub namespace: String,
     pub table: String,
 
-    /// Optional group tag — run cohorts with `--group <name>`.
     pub group: Option<String>,
 
     /// Custom SQL with named placeholders:
     /// - `:watermark`  — last committed watermark (incremental)
     /// - `:_cursor`    — injected by engine when `cursor_column` is set
     /// - `:param_name` — any key from a RabbitMQ payload
+    /// - `_op`         — operation type column required by `merge_into`
     pub sql: String,
 
-    /// Watermark column for incremental tracking (e.g. `updated_at`).
     pub watermark_column: Option<String>,
-
-    /// Stable, monotonically increasing column for cursor-based pagination
-    /// (e.g. primary key `id`).  Avoids LIMIT/OFFSET drift.
-    ///
-    /// When set the engine wraps the SQL as:
-    /// ```sql
-    /// SELECT * FROM (<user_sql>) _q
-    /// WHERE <cursor_column> > :_cursor
-    /// ORDER BY <cursor_column>
-    /// LIMIT <batch_size>
-    /// ```
     pub cursor_column: Option<String>,
-
-    /// Run only after the named job has committed successfully.
     pub depends_on: Option<String>,
 
     #[serde(default = "default_batch_size")]
@@ -315,8 +382,20 @@ pub struct SyncJob {
     #[serde(default)]
     pub schema_evolution: SchemaEvolutionConfig,
 
-    /// Per-job retry override.
     pub retry: Option<RetryConfig>,
+
+    // ── Write strategy ────────────────────────────────────────────────────────
+    /// How the engine commits each batch to the Iceberg table.
+    /// Defaults to `append` (additive, no read-before-write).
+    #[serde(default)]
+    pub write_mode: WriteMode,
+
+    /// Partition column for `write_mode: overwrite`.
+    /// The engine replaces all existing data files in this partition.
+    pub partition_column: Option<String>,
+
+    /// Merge config for `write_mode: upsert` and `write_mode: merge_into`.
+    pub merge: Option<MergeConfig>,
 }
 
 fn default_batch_size() -> usize {
@@ -343,6 +422,240 @@ pub struct RabbitMqConfig {
 pub struct QueueBinding {
     pub queue: String,
     pub job: String,
-    /// Dead-letter exchange for nacked messages.
     pub dead_letter_exchange: Option<String>,
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_config(extra_job_yaml: &str) -> String {
+        // Re-indent every line of `extra_job_yaml` with 4 spaces so that
+        // multi-line blocks (merge:, cursor_column:, etc.) are parsed as
+        // children of the job list item rather than falling to the top level.
+        let indented = extra_job_yaml
+            .lines()
+            .enumerate()
+            .map(|(i, line)| {
+                if i == 0 {
+                    line.to_string() // first line already sits after "    " in the template
+                } else {
+                    format!("    {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            r#"
+sources:
+  pg:
+    type: postgres
+    dsn: "host=localhost dbname=test user=test password=test"
+destinations:
+  wh:
+    catalog_uri: "http://localhost:8181"
+    s3_endpoint: "http://localhost:9000"
+    access_key_id: minioadmin
+    secret_access_key: minioadmin
+sync_jobs:
+  - name: test_job
+    source: pg
+    destination: wh
+    namespace: shop
+    table: test
+    sql: "SELECT 1"
+    {indented}
+"#
+        )
+    }
+
+    fn parse(yaml: &str) -> anyhow::Result<SyncConfig> {
+        let cfg: SyncConfig = serde_yaml::from_str(yaml)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    // ── WriteMode defaults ────────────────────────────────────────────────────
+
+    #[test]
+    fn write_mode_defaults_to_append() {
+        let cfg = parse(&minimal_config("")).unwrap();
+        assert_eq!(cfg.sync_jobs[0].write_mode, WriteMode::Append);
+    }
+
+    #[test]
+    fn write_mode_append_explicit() {
+        let cfg = parse(&minimal_config("write_mode: append")).unwrap();
+        assert_eq!(cfg.sync_jobs[0].write_mode, WriteMode::Append);
+    }
+
+    // ── Overwrite ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn overwrite_requires_partition_column() {
+        let err = parse(&minimal_config("write_mode: overwrite")).unwrap_err();
+        assert!(
+            err.to_string().contains("partition_column"),
+            "expected partition_column error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn overwrite_with_partition_column_is_valid() {
+        let cfg = parse(&minimal_config(
+            "write_mode: overwrite\npartition_column: sale_date",
+        ))
+        .unwrap();
+        assert_eq!(cfg.sync_jobs[0].write_mode, WriteMode::Overwrite);
+        assert_eq!(
+            cfg.sync_jobs[0].partition_column.as_deref(),
+            Some("sale_date")
+        );
+    }
+
+    // ── Upsert ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_requires_merge_block() {
+        let err = parse(&minimal_config("write_mode: upsert")).unwrap_err();
+        assert!(
+            err.to_string().contains("merge"),
+            "expected merge error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn upsert_requires_non_empty_key_columns() {
+        let err = parse(&minimal_config(
+            "write_mode: upsert\nmerge:\n  key_columns: []",
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("key_columns"),
+            "expected key_columns error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn upsert_with_key_columns_is_valid() {
+        let cfg = parse(&minimal_config(
+            "write_mode: upsert\nmerge:\n  key_columns: [id]",
+        ))
+        .unwrap();
+        assert_eq!(cfg.sync_jobs[0].write_mode, WriteMode::Upsert);
+        let merge = cfg.sync_jobs[0].merge.as_ref().unwrap();
+        assert_eq!(merge.key_columns, vec!["id"]);
+        assert!(!merge.hard_delete);
+    }
+
+    #[test]
+    fn upsert_hard_delete_flag() {
+        let cfg = parse(&minimal_config(
+            "write_mode: upsert\nmerge:\n  key_columns: [id]\n  hard_delete: true",
+        ))
+        .unwrap();
+        assert!(cfg.sync_jobs[0].merge.as_ref().unwrap().hard_delete);
+    }
+
+    // ── MergeInto ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn merge_into_requires_merge_block() {
+        let err = parse(&minimal_config("write_mode: merge_into")).unwrap_err();
+        assert!(
+            err.to_string().contains("merge"),
+            "expected merge error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn merge_into_with_composite_key_is_valid() {
+        let cfg = parse(&minimal_config(
+            "write_mode: merge_into\nmerge:\n  key_columns: [tenant_id, user_id]",
+        ))
+        .unwrap();
+        assert_eq!(cfg.sync_jobs[0].write_mode, WriteMode::MergeInto);
+        assert_eq!(
+            cfg.sync_jobs[0].merge.as_ref().unwrap().key_columns,
+            vec!["tenant_id", "user_id"]
+        );
+    }
+
+    // ── Existing validation invariants ────────────────────────────────────────
+
+    #[test]
+    fn cursor_column_rejected_with_full_mode() {
+        let yaml = minimal_config("mode: full\ncursor_column: id");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.to_string().contains("cursor_column"));
+    }
+
+    #[test]
+    fn unknown_source_rejected() {
+        let yaml = minimal_config("").replace("source: pg", "source: nonexistent_src");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.to_string().contains("nonexistent_src"));
+    }
+
+    #[test]
+    fn dependency_cycle_rejected() {
+        let yaml = r#"
+sources:
+  pg:
+    type: postgres
+    dsn: "host=localhost dbname=test user=test password=test"
+destinations:
+  wh:
+    catalog_uri: "http://localhost:8181"
+    s3_endpoint: "http://localhost:9000"
+    access_key_id: minioadmin
+    secret_access_key: minioadmin
+sync_jobs:
+  - name: a
+    source: pg
+    destination: wh
+    namespace: x
+    table: a
+    sql: "SELECT 1"
+    depends_on: b
+  - name: b
+    source: pg
+    destination: wh
+    namespace: x
+    table: b
+    sql: "SELECT 1"
+    depends_on: a
+"#;
+        let err = parse(yaml).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("cycle"));
+    }
+
+    // ── Serialisation round-trip ──────────────────────────────────────────────
+
+    #[test]
+    fn write_mode_round_trips_through_yaml() {
+        for (mode_str, expected) in [
+            ("append", WriteMode::Append),
+            ("overwrite", WriteMode::Overwrite),
+            ("upsert", WriteMode::Upsert),
+            ("merge_into", WriteMode::MergeInto),
+        ] {
+            let mode: WriteMode = serde_yaml::from_str(mode_str).unwrap();
+            assert_eq!(mode, expected, "failed for {mode_str}");
+            let back = serde_yaml::to_string(&mode).unwrap();
+            assert!(
+                back.trim() == mode_str,
+                "round-trip failed for {mode_str}: got {back}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_config_hard_delete_defaults_false() {
+        let mc: MergeConfig = serde_yaml::from_str("key_columns: [id]").unwrap();
+        assert!(!mc.hard_delete);
+    }
 }
