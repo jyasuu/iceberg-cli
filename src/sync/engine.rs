@@ -523,7 +523,8 @@ fn table_ident(namespace: &str, table: &str) -> Result<TableIdent> {
     Ok(TableIdent::new(ns, table.to_string()))
 }
 
-fn _inject_field_ids(batch: RecordBatch, schema: &IcebergSchema) -> Result<RecordBatch> {
+#[allow(dead_code)]
+fn inject_field_ids(batch: RecordBatch, schema: &IcebergSchema) -> Result<RecordBatch> {
     use arrow_schema::Field;
     use std::sync::Arc;
 
@@ -663,12 +664,63 @@ pub async fn run_jobs_parallel<C: Catalog + Sync>(
     results
 }
 
+/// Removes the internal `_pgcursor` column from a RecordBatch if it exists.
+/// This is used to strip the synthetic cursor sentinel before writing to Iceberg.
+fn drop_sentinel_column(batch: RecordBatch) -> Result<RecordBatch> {
+    let schema = batch.schema();
+
+    // Check if the sentinel column exists in the schema
+    match schema.index_of("_pgcursor") {
+        Ok(idx) => {
+            let mut fields = schema.fields().to_vec();
+            fields.remove(idx);
+
+            let mut columns = batch.columns().to_vec();
+            columns.remove(idx);
+
+            // Reconstruct the schema and the batch without the sentinel column
+            let new_schema = std::sync::Arc::new(
+                ArrowSchema::new(fields).with_metadata(schema.metadata().clone()),
+            );
+
+            RecordBatch::try_new(new_schema, columns)
+                .context("Failed to rebuild RecordBatch after dropping sentinel column")
+        }
+        // If the column isn't found, just return the batch as-is
+        Err(_) => Ok(batch),
+    }
+}
+
+/// Remove a named column from a [`RecordBatch`] if it exists, returning the
+/// batch unchanged if the column is absent.
+///
+/// Used to strip CDC-only columns (e.g. `_op` for `merge_into`) from the
+/// batch before table auto-creation and schema injection, so they never
+/// become permanent Iceberg columns.
+fn strip_column_if_present(batch: RecordBatch, col_name: &str) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    match schema.index_of(col_name) {
+        Ok(idx) => {
+            let mut fields = schema.fields().to_vec();
+            fields.remove(idx);
+            let mut columns = batch.columns().to_vec();
+            columns.remove(idx);
+            let new_schema = std::sync::Arc::new(
+                ArrowSchema::new(fields).with_metadata(schema.metadata().clone()),
+            );
+            RecordBatch::try_new(new_schema, columns)
+                .context("Failed to rebuild RecordBatch after stripping column")
+        }
+        Err(_) => Ok(batch),
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::MergeConfig;
+    // use crate::config::MergeConfig;
 
     fn base_job() -> SyncJob {
         SyncJob {
@@ -958,56 +1010,5 @@ mod tests {
             inject_field_ids(batch, &iceberg_schema).is_err(),
             "should error when column has no Iceberg field"
         );
-    }
-}
-
-/// Removes the internal `_pgcursor` column from a RecordBatch if it exists.
-/// This is used to strip the synthetic cursor sentinel before writing to Iceberg.
-fn drop_sentinel_column(batch: RecordBatch) -> Result<RecordBatch> {
-    let schema = batch.schema();
-
-    // Check if the sentinel column exists in the schema
-    match schema.index_of("_pgcursor") {
-        Ok(idx) => {
-            let mut fields = schema.fields().to_vec();
-            fields.remove(idx);
-
-            let mut columns = batch.columns().to_vec();
-            columns.remove(idx);
-
-            // Reconstruct the schema and the batch without the sentinel column
-            let new_schema = std::sync::Arc::new(
-                ArrowSchema::new(fields).with_metadata(schema.metadata().clone()),
-            );
-
-            RecordBatch::try_new(new_schema, columns)
-                .context("Failed to rebuild RecordBatch after dropping sentinel column")
-        }
-        // If the column isn't found, just return the batch as-is
-        Err(_) => Ok(batch),
-    }
-}
-
-/// Remove a named column from a [`RecordBatch`] if it exists, returning the
-/// batch unchanged if the column is absent.
-///
-/// Used to strip CDC-only columns (e.g. `_op` for `merge_into`) from the
-/// batch before table auto-creation and schema injection, so they never
-/// become permanent Iceberg columns.
-fn strip_column_if_present(batch: RecordBatch, col_name: &str) -> Result<RecordBatch> {
-    let schema = batch.schema();
-    match schema.index_of(col_name) {
-        Ok(idx) => {
-            let mut fields = schema.fields().to_vec();
-            fields.remove(idx);
-            let mut columns = batch.columns().to_vec();
-            columns.remove(idx);
-            let new_schema = std::sync::Arc::new(
-                ArrowSchema::new(fields).with_metadata(schema.metadata().clone()),
-            );
-            RecordBatch::try_new(new_schema, columns)
-                .context("Failed to rebuild RecordBatch after stripping column")
-        }
-        Err(_) => Ok(batch),
     }
 }

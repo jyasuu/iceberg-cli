@@ -2068,7 +2068,7 @@ mod write_strategies {
 
     /// Build a minimal YAML sync config string.
     fn sync_cfg(
-        source_table: &str,
+        _source_table: &str,
         iceberg_ns: &str,
         iceberg_table: &str,
         sql: &str,
