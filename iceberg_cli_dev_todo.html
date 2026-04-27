@@ -1,0 +1,275 @@
+
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  .root { padding: 1.5rem 0; font-family: var(--font-sans); }
+  .phase { margin-bottom: 2rem; }
+  .phase-header { display: flex; align-items: center; gap: 10px; margin-bottom: 0.75rem; }
+  .phase-badge { font-size: 11px; font-weight: 500; padding: 3px 10px; border-radius: 20px; white-space: nowrap; }
+  .phase-title { font-size: 15px; font-weight: 500; color: var(--color-text-primary); }
+  .tasks { display: flex; flex-direction: column; gap: 8px; }
+  .task { background: var(--color-background-primary); border: 0.5px solid var(--color-border-tertiary); border-radius: var(--border-radius-md); padding: 10px 14px; cursor: pointer; transition: border-color 0.15s; }
+  .task:hover { border-color: var(--color-border-secondary); }
+  .task-top { display: flex; align-items: flex-start; gap: 10px; }
+  .task-icon { font-size: 14px; margin-top: 1px; flex-shrink: 0; width: 18px; text-align: center; }
+  .task-main { flex: 1; min-width: 0; }
+  .task-title { font-size: 13px; font-weight: 500; color: var(--color-text-primary); margin: 0 0 2px; }
+  .task-desc { font-size: 12px; color: var(--color-text-secondary); margin: 0; line-height: 1.5; }
+  .task-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+  .tag { font-size: 11px; padding: 2px 8px; border-radius: 12px; }
+  .tag-rust { background: #FAEEDA; color: #854F0B; }
+  .tag-config { background: #EAF3DE; color: #3B6D11; }
+  .tag-test { background: #EEEDFE; color: #534AB7; }
+  .tag-iceberg { background: #E1F5EE; color: #0F6E56; }
+  .tag-breaking { background: #FCEBEB; color: #A32D2D; }
+  .tag-infra { background: #E6F1FB; color: #185FA5; }
+  .divider { border: none; border-top: 0.5px solid var(--color-border-tertiary); margin: 1.5rem 0; }
+  .send-btn { font-size: 11px; color: var(--color-text-secondary); padding: 3px 8px; border: 0.5px solid var(--color-border-tertiary); border-radius: 12px; background: transparent; cursor: pointer; margin-top: 6px; display: inline-block; transition: background 0.12s; }
+  .send-btn:hover { background: var(--color-background-secondary); }
+  .phase-p1 .phase-badge { background: #FCEBEB; color: #A32D2D; }
+  .phase-p2 .phase-badge { background: #FAEEDA; color: #854F0B; }
+  .phase-p3 .phase-badge { background: #EAF3DE; color: #3B6D11; }
+  .phase-p4 .phase-badge { background: #E6F1FB; color: #185FA5; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 1.5rem; }
+</style>
+<div class="root">
+  <div class="legend">
+    <span class="tag tag-iceberg">iceberg-rust API</span>
+    <span class="tag tag-rust">Rust impl</span>
+    <span class="tag tag-config">config / YAML</span>
+    <span class="tag tag-test">tests</span>
+    <span class="tag tag-infra">infra / ops</span>
+    <span class="tag tag-breaking">breaking / risk</span>
+  </div>
+
+  <div class="phase phase-p1">
+    <div class="phase-header">
+      <span class="phase-badge">Phase 1 — Critical gaps</span>
+    </div>
+    <div class="tasks">
+
+      <div class="task">
+        <div class="task-top">
+          <span class="task-icon">🧱</span>
+          <div class="task-main">
+            <p class="task-title">True Iceberg day-transform partitioning</p>
+            <p class="task-desc">Current overwrite uses <code>partition_column</code> as a row filter (COW full-scan). Implement a real <code>PartitionSpec</code> with <code>day(col)</code> transform so each batch lands in the correct day bucket — enabling scan pruning and atomic per-day overwrite without scanning other partitions.</p>
+            <div class="task-tags">
+              <span class="tag tag-iceberg">iceberg-rust API</span>
+              <span class="tag tag-rust">Rust impl</span>
+              <span class="tag tag-config">config / YAML</span>
+              <span class="tag tag-breaking">breaking / risk</span>
+            </div>
+            <button class="send-btn" onclick="sendPrompt('Walk me through implementing true Iceberg day-transform partitioning in iceberg-rust 0.9 — what PartitionSpec and TableCreation APIs do I need?')">Ask Claude how to implement ↗</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="task">
+        <div class="task-top">
+          <span class="task-icon">🗑️</span>
+          <div class="task-main">
+            <p class="task-title">Position-delete files (MOR path)</p>
+            <p class="task-desc">All write modes (upsert, merge_into) currently fall back to full COW rewrites because <code>fast_append</code> rejects <code>EqualityDeletes</code>. When iceberg-rust exposes <code>add_delete_files()</code>, switch upsert and merge_into to produce real position-delete files — far cheaper at scale.</p>
+            <div class="task-tags">
+              <span class="tag tag-iceberg">iceberg-rust API</span>
+              <span class="tag tag-rust">Rust impl</span>
+            </div>
+            <button class="send-btn" onclick="sendPrompt('What is the roadmap for position-delete file support in iceberg-rust 0.9, and how should I structure the code to make swapping from COW to MOR easy later?')">Ask Claude ↗</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="task">
+        <div class="task-top">
+          <span class="task-icon">📋</span>
+          <div class="task-main">
+            <p class="task-title">Schema evolution: drop-column + rename</p>
+            <p class="task-desc"><code>allow_add_columns</code> is implemented. Add <code>allow_drop_columns</code> and <code>allow_rename_columns</code> to <code>SchemaEvolutionConfig</code>, plus the corresponding <code>UpdateSchema</code> transaction actions in the engine.</p>
+            <div class="task-tags">
+              <span class="tag tag-iceberg">iceberg-rust API</span>
+              <span class="tag tag-config">config / YAML</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <hr class="divider"/>
+
+  <div class="phase phase-p2">
+    <div class="phase-header">
+      <span class="phase-badge">Phase 2 — Write-strategy completions</span>
+    </div>
+    <div class="tasks">
+
+      <div class="task">
+        <div class="task-top">
+          <span class="task-icon">✏️</span>
+          <div class="task-main">
+            <p class="task-title">Hard-delete purge post-commit hook</p>
+            <p class="task-desc">When <code>hard_delete: true</code>, the engine marks rows but doesn't automatically schedule <code>EXPIRE_SNAPSHOTS</code>. Add a post-commit step (or a CLI subcommand) that runs expiry so GDPR erasure is actually durable — not just logical.</p>
+            <div class="task-tags">
+              <span class="tag tag-rust">Rust impl</span>
+              <span class="tag tag-iceberg">iceberg-rust API</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="task">
+        <div class="task-top">
+          <span class="task-icon">🔀</span>
+          <div class="task-main">
+            <p class="task-title">Merge-into unknown <code>_op</code> handling</p>
+            <p class="task-desc">Unknown <code>_op</code> values are treated as inserts with a warning. Define a strict mode (<code>merge.unknown_op: reject | warn | insert</code>) configurable per job, and surface the count of unknown ops in sync metrics.</p>
+            <div class="task-tags">
+              <span class="tag tag-config">config / YAML</span>
+              <span class="tag tag-rust">Rust impl</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="task">
+        <div class="task-top">
+          <span class="task-icon">⚡</span>
+          <div class="task-main">
+            <p class="task-title">Composite-key upsert scan optimisation</p>
+            <p class="task-desc">Upsert/merge_into currently scans all existing files to locate key positions. When the table is partitioned, restrict the scan to only the relevant partitions using Iceberg predicate pushdown — avoids scanning unrelated day buckets.</p>
+            <div class="task-tags">
+              <span class="tag tag-iceberg">iceberg-rust API</span>
+              <span class="tag tag-rust">Rust impl</span>
+            </div>
+            <button class="send-btn" onclick="sendPrompt('How can I apply partition predicate pushdown when scanning Iceberg files in iceberg-rust 0.9 for a upsert key lookup?')">Ask Claude ↗</button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <hr class="divider"/>
+
+  <div class="phase phase-p3">
+    <div class="phase-header">
+      <span class="phase-badge">Phase 3 — Sync config & operations</span>
+    </div>
+    <div class="tasks">
+
+      <div class="task">
+        <div class="task-top">
+          <span class="task-icon">🔧</span>
+          <div class="task-main">
+            <p class="task-title">Production operations subcommands</p>
+            <p class="task-desc">Add CLI subcommands for manual ops: <code>iceberg-cli compact &lt;table&gt;</code> (REWRITE_DATA_FILES), <code>iceberg-cli expire &lt;table&gt;</code> (EXPIRE_SNAPSHOTS), <code>iceberg-cli rewrite-manifests &lt;table&gt;</code>. Needed for compaction after heavy upsert workloads.</p>
+            <div class="task-tags">
+              <span class="tag tag-rust">Rust impl</span>
+              <span class="tag tag-infra">infra / ops</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="task">
+        <div class="task-top">
+          <span class="task-icon">📦</span>
+          <div class="task-main">
+            <p class="task-title">Batch-atomic multi-table group commit</p>
+            <p class="task-desc"><code>depends_on</code> ensures ordering but each job commits independently. For critical multi-table groups (e.g. orders → order_items), provide an option to buffer all writes and commit them in a single coordinated step — or document the exact failure/retry semantics.</p>
+            <div class="task-tags">
+              <span class="tag tag-rust">Rust impl</span>
+              <span class="tag tag-config">config / YAML</span>
+              <span class="tag tag-breaking">breaking / risk</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="task">
+        <div class="task-top">
+          <span class="task-icon">🐇</span>
+          <div class="task-main">
+            <p class="task-title">RabbitMQ dead-letter + back-pressure</p>
+            <p class="task-desc">DLX is configured per queue but there's no handling for consumer back-pressure or max-in-flight limits. Add <code>prefetch_count</code> config and a circuit-breaker that pauses consumption when the Iceberg commit error rate is high.</p>
+            <div class="task-tags">
+              <span class="tag tag-rust">Rust impl</span>
+              <span class="tag tag-config">config / YAML</span>
+              <span class="tag tag-infra">infra / ops</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="task">
+        <div class="task-top">
+          <span class="task-icon">🌊</span>
+          <div class="task-main">
+            <p class="task-title">Watermark time-series sync point persistence</p>
+            <p class="task-desc">Verify that the metadata watermark survives a crash mid-batch and resumes from the last committed point without double-writing. Add an integration test that kills the process after Parquet write but before metadata commit, then restarts.</p>
+            <div class="task-tags">
+              <span class="tag tag-test">tests</span>
+              <span class="tag tag-rust">Rust impl</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <hr class="divider"/>
+
+  <div class="phase phase-p4">
+    <div class="phase-header">
+      <span class="phase-badge">Phase 4 — Testing & observability</span>
+    </div>
+    <div class="tasks">
+
+      <div class="task">
+        <div class="task-top">
+          <span class="task-icon">🧪</span>
+          <div class="task-main">
+            <p class="task-title">Integration tests for all four write strategies</p>
+            <p class="task-desc">The <code>write_strategies</code> test module exists but covers mostly append and overwrite. Add end-to-end integration tests for upsert composite-key, merge_into with I/U/D routing, GDPR hard-delete, and Debezium-style CDC — using the real Postgres + MinIO + REST catalog stack from docker-compose.</p>
+            <div class="task-tags">
+              <span class="tag tag-test">tests</span>
+              <span class="tag tag-infra">infra / ops</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="task">
+        <div class="task-top">
+          <span class="task-icon">📊</span>
+          <div class="task-main">
+            <p class="task-title">Structured sync metrics output</p>
+            <p class="task-desc">Emit per-job metrics (rows_appended, rows_deleted, batch_duration_ms, files_written, watermark) as structured JSON or Prometheus counters. Needed for production alerting on stale watermarks or unexpected zero-row batches.</p>
+            <div class="task-tags">
+              <span class="tag tag-rust">Rust impl</span>
+              <span class="tag tag-infra">infra / ops</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="task">
+        <div class="task-top">
+          <span class="task-icon">🔍</span>
+          <div class="task-main">
+            <p class="task-title">Dry-run diff output</p>
+            <p class="task-desc">The <code>--dry-run</code> flag skips writes but doesn't show what <em>would</em> change. Add a diff mode that prints the partition values affected, row counts, and which files would be replaced — useful for production ops sign-off before a full-refresh run.</p>
+            <div class="task-tags">
+              <span class="tag tag-rust">Rust impl</span>
+              <span class="tag tag-config">config / YAML</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
