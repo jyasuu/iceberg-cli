@@ -36,6 +36,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub(crate) mod validation;
+
 // ── Top-level ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -57,99 +59,6 @@ impl SyncConfig {
             .map_err(|e| anyhow::anyhow!("Invalid YAML in '{}': {}", path, e))?;
         cfg.validate()?;
         Ok(cfg)
-    }
-
-    fn validate(&self) -> anyhow::Result<()> {
-        for job in &self.sync_jobs {
-            anyhow::ensure!(
-                self.sources.contains_key(&job.source),
-                "Job '{}' references unknown source '{}'",
-                job.name,
-                job.source
-            );
-            anyhow::ensure!(
-                self.destinations.contains_key(&job.destination),
-                "Job '{}' references unknown destination '{}'",
-                job.name,
-                job.destination
-            );
-            if let Some(dep) = &job.depends_on {
-                anyhow::ensure!(
-                    self.sync_jobs.iter().any(|j| &j.name == dep),
-                    "Job '{}' depends_on unknown job '{}'",
-                    job.name,
-                    dep
-                );
-            }
-            if job.cursor_column.is_some() && job.mode == SyncMode::Full {
-                anyhow::bail!(
-                    "Job '{}': cursor_column cannot be used with mode: full",
-                    job.name
-                );
-            }
-
-            // ── Write-mode constraints ──────────────────────────────────────
-            match &job.write_mode {
-                WriteMode::Overwrite => anyhow::ensure!(
-                    job.partition_column.is_some() || job.iceberg_partition.is_some(),
-                    "Job '{}': write_mode=overwrite requires either partition_column or iceberg_partition to be set",
-                    job.name
-                ),
-                WriteMode::Upsert | WriteMode::MergeInto => {
-                    let merge = job.merge.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Job '{}': write_mode={:?} requires a 'merge' block with key_columns",
-                            job.name,
-                            job.write_mode
-                        )
-                    })?;
-                    anyhow::ensure!(
-                        !merge.key_columns.is_empty(),
-                        "Job '{}': merge.key_columns must not be empty",
-                        job.name
-                    );
-                }
-                WriteMode::Append => {}
-            }
-        }
-        self.detect_cycles()?;
-        Ok(())
-    }
-
-    fn detect_cycles(&self) -> anyhow::Result<()> {
-        use std::collections::HashSet;
-        let mut visiting: HashSet<&str> = HashSet::new();
-        let mut visited: HashSet<&str> = HashSet::new();
-
-        fn dfs<'a>(
-            name: &'a str,
-            jobs: &'a [SyncJob],
-            visiting: &mut HashSet<&'a str>,
-            visited: &mut HashSet<&'a str>,
-        ) -> anyhow::Result<()> {
-            if visited.contains(name) {
-                return Ok(());
-            }
-            anyhow::ensure!(
-                !visiting.contains(name),
-                "Dependency cycle detected involving job '{}'",
-                name
-            );
-            visiting.insert(name);
-            if let Some(job) = jobs.iter().find(|j| j.name == name)
-                && let Some(dep) = &job.depends_on
-            {
-                dfs(dep, jobs, visiting, visited)?;
-            }
-            visiting.remove(name);
-            visited.insert(name);
-            Ok(())
-        }
-
-        for name in self.sync_jobs.iter().map(|j| j.name.as_str()) {
-            dfs(name, &self.sync_jobs, &mut visiting, &mut visited)?;
-        }
-        Ok(())
     }
 
     pub fn ordered_jobs(&self) -> anyhow::Result<Vec<&SyncJob>> {

@@ -31,12 +31,13 @@
 //!       --table my_db.products \
 //!       --schema "id:long,name:string,price:double"
 
+mod cmd;
 mod config;
 mod sync;
 
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use arrow_array::{
     ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
     StringArray,
@@ -47,10 +48,9 @@ use comfy_table::{Table, presets::UTF8_FULL};
 use config::SyncConfig;
 use futures::TryStreamExt;
 use iceberg::{
-    Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent,
+    Catalog, CatalogBuilder, TableCreation,
     spec::{
         DataFileFormat,
-        NestedField,
         PartitionKey,
         // PartitionSpec,
         PrimitiveType,
@@ -636,52 +636,8 @@ async fn cmd_create_table(catalog: &impl Catalog, table_str: &str, schema_str: &
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-fn parse_namespace(s: &str) -> Result<NamespaceIdent> {
-    NamespaceIdent::from_strs(s.split('.').collect::<Vec<_>>())
-        .map_err(|e| anyhow!("Invalid namespace '{s}': {e}"))
-}
-
-fn parse_table(s: &str) -> Result<TableIdent> {
-    let parts: Vec<&str> = s.rsplitn(2, '.').collect();
-    match parts.as_slice() {
-        [name, namespace] => {
-            let ns = parse_namespace(namespace)?;
-            Ok(TableIdent::new(ns, name.to_string()))
-        }
-        _ => bail!("Expected 'namespace.table', got '{s}'"),
-    }
-}
-
-fn parse_schema(spec: &str) -> Result<Schema> {
-    let mut fields = Vec::new();
-    for (idx, part) in spec.split(',').enumerate() {
-        let kv: Vec<&str> = part.trim().splitn(2, ':').collect();
-        if kv.len() != 2 {
-            bail!("Bad field spec '{part}' — expected 'name:type'");
-        }
-        let name = kv[0].trim();
-        let ptype = match kv[1].trim().to_lowercase().as_str() {
-            "long" | "int64" => PrimitiveType::Long,
-            "int" | "int32" => PrimitiveType::Int,
-            "string" | "str" => PrimitiveType::String,
-            "double" | "float64" => PrimitiveType::Double,
-            "float" | "float32" => PrimitiveType::Float,
-            "boolean" | "bool" => PrimitiveType::Boolean,
-            "date" => PrimitiveType::Date,
-            "timestamp" => PrimitiveType::Timestamp,
-            other => bail!("Unknown type '{other}'"),
-        };
-        let field_id = (idx + 1) as i32;
-        fields.push(NestedField::optional(field_id, name, Type::Primitive(ptype)).into());
-    }
-
-    Schema::builder()
-        .with_fields(fields)
-        .with_schema_id(1)
-        .build()
-        .context("build schema")
-}
+// parse_namespace / parse_table / parse_schema moved to src/cmd/parse.rs
+use cmd::parse::{parse_namespace, parse_schema, parse_table};
 
 fn arrow_value_to_string(array: &ArrayRef, row: usize) -> String {
     use arrow_array::Array;
