@@ -1,6 +1,9 @@
 pub mod engine;
 pub mod file_name;
 pub mod metadata;
+pub(crate) mod pagination;
+pub(crate) mod partition;
 pub mod postgres;
 pub mod rabbitmq;
+pub(crate) mod schema;
 pub mod write_strategies;
