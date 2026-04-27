@@ -61,3 +61,51 @@ INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES
 
 CREATE INDEX IF NOT EXISTS orders_updated_at_idx    ON orders(updated_at);
 CREATE INDEX IF NOT EXISTS products_updated_at_idx  ON products(updated_at);
+
+
+-- ── Write-strategy integration test tables ────────────────────────────────────
+-- These tables are used by the §14 write-strategy integration tests.
+-- Each table is keyed by a test-unique suffix injected at runtime; the
+-- DDL here creates the shared "template" used as a documentation reference.
+
+-- Generic event log for APPEND tests.
+CREATE TABLE IF NOT EXISTS ws_events (
+    id         BIGSERIAL PRIMARY KEY,
+    label      TEXT        NOT NULL,
+    value      BIGINT      NOT NULL,
+    event_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Daily snapshot table for OVERWRITE tests.
+CREATE TABLE IF NOT EXISTS ws_daily_snapshot (
+    id         BIGSERIAL PRIMARY KEY,
+    snap_date  TEXT        NOT NULL,  -- 'YYYY-MM-DD'
+    metric     TEXT        NOT NULL,
+    amount     NUMERIC(14,2) NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Mutable entity table for UPSERT tests (soft-delete via is_deleted flag).
+CREATE TABLE IF NOT EXISTS ws_entities (
+    id         BIGSERIAL PRIMARY KEY,
+    tenant_id  TEXT        NOT NULL DEFAULT 'default',
+    name       TEXT        NOT NULL,
+    status     TEXT        NOT NULL DEFAULT 'active',
+    is_deleted BOOLEAN     NOT NULL DEFAULT false,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- CDC outbox table for MERGE INTO tests (_op carries I / U / D).
+CREATE TABLE IF NOT EXISTS ws_cdc_outbox (
+    id         BIGSERIAL PRIMARY KEY,
+    entity_id  BIGINT      NOT NULL,
+    name       TEXT,
+    status     TEXT,
+    op         TEXT        NOT NULL,  -- 'I', 'U', 'D'
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ws_events_updated_at_idx     ON ws_events(updated_at);
+CREATE INDEX IF NOT EXISTS ws_entities_updated_at_idx   ON ws_entities(updated_at);
+CREATE INDEX IF NOT EXISTS ws_cdc_outbox_occurred_at_idx ON ws_cdc_outbox(occurred_at);

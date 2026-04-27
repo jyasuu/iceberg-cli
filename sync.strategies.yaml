@@ -1,0 +1,501 @@
+# sync.strategies.yaml
+#
+# Comprehensive write-strategy reference configuration.
+#
+# Covers all four Iceberg write modes with production-realistic examples:
+#
+#   Strategy     write_mode    Iceberg mechanism             Typical source
+#   ─────────────────────────────────────────────────────────────────────────
+#   APPEND        append        fast_append                  Events, logs, CDC inserts
+#   OVERWRITE     overwrite     replace_data_files           Daily partitions, full refresh
+#   UPDATE/DELETE upsert        position-delete + append     PK-keyed CDC (no op column)
+#   MERGE INTO    merge_into    position-delete + append     Debezium / pglogical CDC
+#
+# Run all jobs:
+#   iceberg-cli --uri http://localhost:8181 --s3-endpoint http://localhost:9000 \
+#               sync --config sync.strategies.yaml
+#
+# Run one job:
+#   iceberg-cli ... sync --config sync.strategies.yaml --job <name>
+#
+# Run a group:
+#   iceberg-cli ... sync --config sync.strategies.yaml --group <group>
+#
+# Dry-run (no writes):
+#   iceberg-cli ... sync --config sync.strategies.yaml --dry-run
+#
+# Run with parallelism:
+#   iceberg-cli ... sync --config sync.strategies.yaml --parallel 4
+
+# ── Sources ───────────────────────────────────────────────────────────────────
+
+sources:
+  main_pg:
+    type: postgres
+    dsn: "host=localhost port=5432 dbname=shop user=app password=secret sslmode=disable"
+
+# ── Destinations ──────────────────────────────────────────────────────────────
+
+destinations:
+  warehouse:
+    catalog_uri:       "http://localhost:8181"
+    s3_endpoint:       "http://localhost:9000"
+    region:            "us-east-1"
+    access_key_id:     minioadmin
+    secret_access_key: minioadmin
+
+# ── Global retry policy ───────────────────────────────────────────────────────
+
+retry:
+  max_attempts: 3
+  initial_delay_ms: 500
+  backoff_multiplier: 2.0
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY 1: APPEND
+#
+# Pattern:  Only add new rows. Never touch existing data files.
+# Iceberg:  fast_append — produces one new data file per batch.
+# Cost:     Lowest — no read-before-write.
+#
+# When to use:
+#   • Immutable events (clicks, payments, sensor readings)
+#   • Insert-only CDC streams (source never updates/deletes)
+#   • Audit logs where history must be preserved exactly
+#   • Any table where you only need the incremental tail
+#
+# Key config:
+#   write_mode: append   ← default, can be omitted
+#   watermark_column     → drives WHERE updated_at > :watermark
+#   cursor_column        → enables stable cursor pagination (no OFFSET drift)
+#   mode: incremental    → only fetch rows newer than last watermark
+# ══════════════════════════════════════════════════════════════════════════════
+
+sync_jobs:
+
+  # ── 1a. Event log — pure append, incremental with cursor pagination ─────────
+  - name:        page_events
+    source:      main_pg
+    destination: warehouse
+    namespace:   analytics
+    table:       page_events
+    group:       append_examples
+    write_mode:  append           # default; shown explicitly for clarity
+    mode:        incremental
+    sql: |
+      SELECT
+        e.id,
+        e.session_id,
+        e.user_id,
+        e.page,
+        e.event_type,
+        e.properties::text AS properties,   -- JSONB → text
+        e.created_at
+      FROM page_events e
+      WHERE e.created_at > :watermark
+      ORDER BY e.created_at ASC, e.id ASC
+    watermark_column: created_at
+    cursor_column:    id        # stable PK — avoids OFFSET drift mid-run
+    batch_size: 1000
+    schema_evolution:
+      allow_add_columns: true   # new event properties columns picked up automatically
+
+  # ── 1b. Dependent child table — appended after parent commits ───────────────
+  #
+  # N+1-safe: one JOIN query; no per-row lookup.
+  # depends_on guarantees topological ordering within the group.
+  - name:        order_items
+    source:      main_pg
+    destination: warehouse
+    namespace:   shop
+    table:       order_items
+    group:       append_examples
+    write_mode:  append
+    mode:        incremental
+    sql: |
+      SELECT
+        oi.id,
+        oi.order_id,
+        oi.product_id,
+        oi.quantity,
+        oi.unit_price,
+        oi.line_total,
+        o.updated_at  AS order_updated_at   -- piggy-back parent watermark
+      FROM order_items oi
+      INNER JOIN orders o ON o.id = oi.order_id
+      WHERE o.updated_at > :watermark
+      ORDER BY o.updated_at ASC, oi.id ASC
+    watermark_column: order_updated_at
+    cursor_column:    id
+    depends_on:  orders           # runs after the orders job commits
+    batch_size:  1000
+
+  # ── 1c. RabbitMQ-triggered append — payload parameters injected into SQL ────
+  #
+  # Payload example: {"user_id": 42}
+  # :user_id is substituted at query time.
+  # Each message produces one isolated batch committed atomically.
+  - name:        user_activity_snapshot
+    source:      main_pg
+    destination: warehouse
+    namespace:   analytics
+    table:       user_activity_snapshot
+    write_mode:  append
+    mode:        full             # no watermark; driven entirely by MQ payload
+    sql: |
+      SELECT
+        a.id,
+        a.user_id,
+        a.action,
+        a.resource_id,
+        a.created_at
+      FROM user_activity a
+      WHERE a.user_id = :user_id
+      ORDER BY a.created_at DESC
+    watermark_column: ~
+    batch_size: 200
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY 2: OVERWRITE
+#
+# Pattern:  Delete the old partition, write fresh data in its place.
+# Iceberg:  replace_data_files — atomic swap visible to readers.
+# Cost:     Medium — reads existing partition metadata; writes new files.
+#
+# When to use:
+#   • Daily/hourly snapshot partitions that are fully regenerated each run
+#   • Slow-changing dimension tables (full reload by a date partition)
+#   • Any case where the source query already returns the complete, correct
+#     state of that partition and stale rows must not persist
+#
+# Key config:
+#   write_mode:       overwrite     ← required
+#   partition_column: <col>         ← required; must be a column in the SQL
+#   mode:             full          ← usually full so the whole partition is fetched
+#
+# The engine:
+#   1. Extracts the distinct partition values present in the incoming batch.
+#   2. Writes new Parquet data files.
+#   3. Atomically replaces old data files for those partition values.
+#   First run degrades gracefully to plain append (no old files found).
+# ══════════════════════════════════════════════════════════════════════════════
+
+  # ── 2a. Daily sales snapshot — overwrite one date partition per run ─────────
+  - name:        daily_sales_summary
+    source:      main_pg
+    destination: warehouse
+    namespace:   finance
+    table:       daily_sales_summary
+    group:       overwrite_examples
+    write_mode:  overwrite
+    partition_column: sale_date   # all rows in batch share the same sale_date
+    mode:        full
+    sql: |
+      SELECT
+        DATE(o.created_at)              AS sale_date,
+        p.category,
+        COUNT(DISTINCT o.id)            AS order_count,
+        SUM(oi.line_total)              AS revenue,
+        SUM(oi.quantity)                AS units_sold
+      FROM orders o
+      INNER JOIN order_items oi ON oi.order_id = o.id
+      INNER JOIN products    p  ON p.id = oi.product_id
+      WHERE DATE(o.created_at) = CURRENT_DATE - INTERVAL '1 day'
+      GROUP BY sale_date, p.category
+      ORDER BY sale_date, p.category
+    watermark_column: ~           # date-partition logic is in the SQL itself
+    batch_size: 5000
+    retry:
+      max_attempts: 5
+      initial_delay_ms: 1000
+      backoff_multiplier: 1.5
+
+  # ── 2b. Slow-changing dimension — full table overwrite each run ─────────────
+  #
+  # When the dimension is small enough, overwrite the entire table each run.
+  # Use a synthetic constant partition column so all rows land in one partition.
+  - name:        products_dim
+    source:      main_pg
+    destination: warehouse
+    namespace:   shop
+    table:       products_dim
+    group:       overwrite_examples
+    write_mode:  overwrite
+    partition_column: snapshot_date  # computed in SQL — all rows share same value
+    mode:        full
+    sql: |
+      SELECT
+        p.id,
+        p.sku,
+        p.name,
+        p.category,
+        p.unit_price,
+        p.stock_qty,
+        p.active,
+        CURRENT_DATE::text  AS snapshot_date   -- constant partition key
+      FROM products p
+      ORDER BY p.id
+    watermark_column: ~
+    batch_size: 2000
+    schema_evolution:
+      allow_add_columns: true
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY 3: UPDATE / DELETE  (write_mode: upsert)
+#
+# Pattern:  Locate existing rows by primary key and replace them.
+# Iceberg:  position-delete the old row, append the new row.
+# Cost:     High — must scan data files to locate positions of matched rows.
+#
+# When to use:
+#   • CDC streams that emit the full updated row WITHOUT an explicit op column
+#   • Sources where updated_at is sufficient to detect changed rows, but you
+#     also need to handle hard or soft deletes by secondary signals
+#   • Any PK-keyed source where re-emitting the current row state is enough
+#
+# Key config:
+#   write_mode:        upsert         ← required
+#   merge:
+#     key_columns:     [<pk>, ...]    ← uniquely identifies the logical row
+#     hard_delete:     false          ← true for GDPR erasure (purges history)
+#
+# Notes:
+#   • Both INSERT and UPDATE map to the same code path: delete-old + append-new.
+#   • For physical DELETE from source, use a soft-delete column (is_deleted)
+#     or switch to merge_into with an explicit _op column.
+#   • Requires periodic compaction: REWRITE_DATA_FILES + EXPIRE_SNAPSHOTS.
+# ══════════════════════════════════════════════════════════════════════════════
+
+  # ── 3a. Orders upsert — incremental CDC without explicit op column ──────────
+  - name:        orders
+    source:      main_pg
+    destination: warehouse
+    namespace:   shop
+    table:       orders
+    group:       upsert_examples
+    write_mode:  upsert
+    mode:        incremental
+    sql: |
+      SELECT
+        o.id,
+        o.user_id,
+        o.status,
+        o.total_amount,
+        o.is_deleted,       -- soft-delete flag from source
+        o.created_at,
+        o.updated_at
+      FROM orders o
+      WHERE o.updated_at > :watermark
+      ORDER BY o.updated_at ASC, o.id ASC
+    watermark_column: updated_at
+    cursor_column:    id
+    batch_size: 500
+    merge:
+      key_columns:  [id]    # primary key used to locate the existing row
+      hard_delete:  false   # keep historical snapshots (set true for GDPR)
+    schema_evolution:
+      allow_add_columns: true
+
+  # ── 3b. Users upsert — composite key example ────────────────────────────────
+  - name:        user_profiles
+    source:      main_pg
+    destination: warehouse
+    namespace:   identity
+    table:       user_profiles
+    group:       upsert_examples
+    write_mode:  upsert
+    mode:        incremental
+    sql: |
+      SELECT
+        up.tenant_id,
+        up.user_id,
+        up.display_name,
+        up.email,
+        up.plan_tier,
+        up.updated_at
+      FROM user_profiles up
+      WHERE up.updated_at > :watermark
+      ORDER BY up.updated_at ASC, up.user_id ASC
+    watermark_column: updated_at
+    cursor_column:    user_id
+    batch_size: 1000
+    merge:
+      key_columns:  [tenant_id, user_id]   # composite primary key
+      hard_delete:  false
+
+  # ── 3c. GDPR right-to-erasure upsert ────────────────────────────────────────
+  #
+  # hard_delete: true marks deleted rows as PURGED in the current snapshot.
+  # After this job runs, execute: EXPIRE_SNAPSHOTS to physically remove old files.
+  - name:        consents_gdpr
+    source:      main_pg
+    destination: warehouse
+    namespace:   compliance
+    table:       consents
+    group:       upsert_examples
+    write_mode:  upsert
+    mode:        incremental
+    sql: |
+      SELECT
+        c.id,
+        c.user_id,
+        c.consent_type,
+        c.granted,
+        c.revoked_at,
+        c.updated_at
+      FROM consents c
+      WHERE c.updated_at > :watermark
+      ORDER BY c.updated_at ASC, c.id ASC
+    watermark_column: updated_at
+    cursor_column:    id
+    batch_size: 500
+    merge:
+      key_columns:  [id]
+      hard_delete:  true    # ← physical purge: history is not retained
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY 4: MERGE INTO  (write_mode: merge_into)
+#
+# Pattern:  Route each row by an _op column → INSERT, UPDATE, or DELETE.
+# Iceberg:  I → append data file
+#            U → position-delete old row + append new row
+#            D → position-delete only (no new data row written)
+# Cost:     High — same key-scan cost as upsert, plus op routing overhead.
+#
+# When to use:
+#   • Debezium, pglogical, or any CDC tool that emits op type per row
+#   • Full MERGE semantics where I/U/D must be handled differently
+#   • Tombstone-aware pipelines where deletes must be precisely tracked
+#
+# Key config:
+#   write_mode:  merge_into          ← required
+#   merge:
+#     key_columns: [<pk>, ...]       ← required; used to find row position
+#     hard_delete: false             ← true for GDPR
+#
+# SQL must include an `_op` column with values 'I', 'U', or 'D' (case-insensitive).
+# The engine strips _op before writing to Iceberg — it never lands in the table.
+# Unknown _op values are treated as inserts with a warning.
+# ══════════════════════════════════════════════════════════════════════════════
+
+  # ── 4a. Debezium CDC feed — full I/U/D routing ──────────────────────────────
+  #
+  # Source is a Debezium outbox table that records the op type per row.
+  # The SQL maps Debezium op values (c=create, u=update, d=delete) to I/U/D.
+  - name:        inventory_cdc
+    source:      main_pg
+    destination: warehouse
+    namespace:   warehouse_ops
+    table:       inventory
+    group:       merge_into_examples
+    write_mode:  merge_into
+    mode:        incremental
+    sql: |
+      SELECT
+        cdc.payload->>'id'            AS id,
+        cdc.payload->>'sku'           AS sku,
+        cdc.payload->>'location'      AS location,
+        (cdc.payload->>'qty')::int    AS qty,
+        (cdc.payload->>'unit_cost')::numeric AS unit_cost,
+        cdc.occurred_at,
+        CASE cdc.op
+          WHEN 'c' THEN 'I'           -- Debezium create → INSERT
+          WHEN 'u' THEN 'U'           -- Debezium update → UPDATE
+          WHEN 'd' THEN 'D'           -- Debezium delete → DELETE
+          ELSE          'I'
+        END AS _op                    -- _op stripped before write; never stored
+      FROM debezium_outbox cdc
+      WHERE cdc.table_name = 'inventory'
+        AND cdc.occurred_at > :watermark
+      ORDER BY cdc.occurred_at ASC, cdc.id ASC
+    watermark_column: occurred_at
+    cursor_column:    id
+    batch_size: 500
+    merge:
+      key_columns:  [id]
+      hard_delete:  false
+
+  # ── 4b. Multi-table merge via RabbitMQ — payload-parameterised ──────────────
+  #
+  # MQ payload: {"tenant_id": "acme", "since": "2024-01-01T00:00:00Z"}
+  # Both :tenant_id and :since are substituted at query time.
+  # Each message produces one isolated, atomic batch.
+  - name:        tenant_events_merge
+    source:      main_pg
+    destination: warehouse
+    namespace:   multitenant
+    table:       tenant_events
+    group:       merge_into_examples
+    write_mode:  merge_into
+    mode:        full             # MQ-driven; watermark comes from payload
+    sql: |
+      SELECT
+        e.id,
+        e.tenant_id,
+        e.user_id,
+        e.event_type,
+        e.payload::text AS payload,
+        e.created_at,
+        e.op_type       AS _op    -- source already stores I/U/D
+      FROM tenant_events e
+      WHERE e.tenant_id = :tenant_id
+        AND e.created_at >= :since::timestamptz
+      ORDER BY e.created_at ASC, e.id ASC
+    watermark_column: ~
+    batch_size: 1000
+    merge:
+      key_columns:  [tenant_id, id]   # composite key; tenant_id scopes the scan
+      hard_delete:  false
+
+  # ── 4c. Audit log merge — append-mostly with rare corrections ───────────────
+  #
+  # Most rows are inserts ('I'). Corrections ('U') arrive when a log entry
+  # must be amended. No deletes — compliance requires full retention.
+  - name:        audit_log_merge
+    source:      main_pg
+    destination: warehouse
+    namespace:   ops
+    table:       audit_log
+    group:       merge_into_examples
+    write_mode:  merge_into
+    mode:        incremental
+    sql: |
+      SELECT
+        al.id::text            AS id,
+        al.actor_id,
+        al.action,
+        al.resource,
+        al.payload::text       AS payload,
+        al.created_at,
+        COALESCE(al.correction, 'I') AS _op   -- default to I; amended rows carry 'U'
+      FROM audit_log al
+      WHERE al.created_at > :watermark
+      ORDER BY al.created_at ASC, al.id ASC
+    watermark_column: created_at
+    cursor_column:    id
+    batch_size: 1000
+    merge:
+      key_columns:  [id]
+      hard_delete:  false       # must retain history for compliance
+    schema_evolution:
+      allow_add_columns: true
+
+
+# ── RabbitMQ consumer bindings ────────────────────────────────────────────────
+#
+# Jobs that are triggered by messages rather than a scheduled run.
+# Payload keys must match the :param_name placeholders in the job's SQL.
+
+rabbitmq:
+  uri: "amqp://guest:guest@localhost:5672/%2f"
+  queues:
+    - queue:                user_activity_requests
+      job:                  user_activity_snapshot    # APPEND — payload: {user_id}
+      dead_letter_exchange: dlx.sync
+
+    - queue:                tenant_merge_requests
+      job:                  tenant_events_merge       # MERGE INTO — payload: {tenant_id, since}
+      dead_letter_exchange: dlx.sync

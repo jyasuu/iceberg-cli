@@ -621,12 +621,17 @@ async fn cmd_create_table(catalog: &impl Catalog, table_str: &str, schema_str: &
         .schema(schema)
         .build();
 
-    catalog
-        .create_table(ident.namespace(), creation)
-        .await
-        .with_context(|| format!("create_table({table_str})"))?;
-
-    println!("Created table '{table_str}'.");
+    match catalog.create_table(ident.namespace(), creation).await {
+        Ok(_) => println!("Created table '{table_str}'."),
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("already exists") || msg.contains("already exist") {
+                println!("Table '{table_str}' already exists — skipping.");
+            } else {
+                return Err(e).with_context(|| format!("create_table({table_str})"));
+            }
+        }
+    }
     Ok(())
 }
 
