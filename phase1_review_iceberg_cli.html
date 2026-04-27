@@ -1,0 +1,120 @@
+
+<style>
+*{box-sizing:border-box}
+.root{padding:1.5rem 0;font-family:var(--font-sans)}
+.section-title{font-size:13px;font-weight:500;color:var(--color-text-secondary);letter-spacing:.04em;margin:0 0 .75rem;text-transform:uppercase}
+.task{background:var(--color-background-primary);border:.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);padding:14px 16px;margin-bottom:10px}
+.task-head{display:flex;align-items:flex-start;gap:10px}
+.task-icon{font-size:16px;margin-top:1px;flex-shrink:0}
+.task-body{flex:1;min-width:0}
+.task-title{font-size:13px;font-weight:500;color:var(--color-text-primary);margin:0 0 4px}
+.task-desc{font-size:12px;color:var(--color-text-secondary);margin:0 0 8px;line-height:1.6}
+.tags{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px}
+.tag{font-size:11px;padding:2px 9px;border-radius:12px;font-weight:500}
+.tag-exists{background:#E1F5EE;color:#0F6E56}
+.tag-gap{background:#FCEBEB;color:#A32D2D}
+.tag-partial{background:#FAEEDA;color:#854F0B}
+.tag-blocker{background:#EEEDFE;color:#534AB7}
+.code-ref{font-family:var(--font-mono);font-size:11px;padding:2px 7px;background:var(--color-background-secondary);border:.5px solid var(--color-border-tertiary);border-radius:5px;color:var(--color-text-primary);cursor:pointer;display:inline-block;margin-top:2px}
+.code-ref:hover{border-color:var(--color-border-secondary)}
+.divider{border:none;border-top:.5px solid var(--color-border-tertiary);margin:1.5rem 0}
+.badge{font-size:11px;font-weight:500;padding:3px 10px;border-radius:20px}
+.badge-p1{background:#FCEBEB;color:#A32D2D}
+.phase-hdr{display:flex;align-items:center;gap:8px;margin-bottom:1rem}
+.phase-title{font-size:14px;font-weight:500;color:var(--color-text-primary)}
+.status-row{display:flex;align-items:center;gap:6px;margin-top:6px}
+.bullet{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.bullet-green{background:#1D9E75}
+.bullet-amber{background:#BA7517}
+.bullet-red{background:#E24B4A}
+.status-text{font-size:12px;color:var(--color-text-secondary)}
+</style>
+<div class="root">
+  <div class="phase-hdr">
+    <span class="badge badge-p1">Phase 1 — Critical gaps</span>
+    <span class="phase-title">3 tasks · Codebase review</span>
+  </div>
+
+  <!-- Task 1: True Iceberg day-transform partitioning -->
+  <div class="task">
+    <div class="task-head">
+      <span class="task-icon">🧱</span>
+      <div class="task-body">
+        <p class="task-title">True Iceberg day-transform partitioning</p>
+        <p class="task-desc">
+          The config and <code>build_partition_spec</code> in <code>partition.rs</code> already exist and are wired into table creation in <code>engine.rs</code>. The real gap is in <strong>overwrite</strong>: <code>plan_overwrite</code> does a full-table COW scan and filters by string-equality on the raw column value — it never uses the Iceberg <code>PartitionSpec</code> for scan pruning. The engine also drops + recreates the table on every overwrite, which defeats any partition layout already applied.
+        </p>
+        <div class="tags">
+          <span class="tag tag-exists">✓ build_partition_spec exists</span>
+          <span class="tag tag-exists">✓ TableCreation wires spec</span>
+          <span class="tag tag-partial">~ iceberg_partition config done</span>
+          <span class="tag tag-gap">✗ scan pruning not used</span>
+          <span class="tag tag-gap">✗ drop-recreate defeats spec</span>
+          <span class="tag tag-blocker">blocker: COW scan is always full</span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">
+          <span class="code-ref" onclick="sendPrompt('Show me the plan_overwrite function in write_strategies.rs and the engine COW snapshot replacement block — what needs to change for true partition-scoped overwrite?')">write_strategies.rs:plan_overwrite</span>
+          <span class="code-ref" onclick="sendPrompt('Walk me through the engine.rs COW snapshot replacement block that drops and recreates the table — is that compatible with a real PartitionSpec?')">engine.rs:COW snapshot block</span>
+          <span class="code-ref" onclick="sendPrompt('What iceberg-rust 0.9 APIs exist for scanning only a specific partition using a PartitionSpec predicate?')">partition.rs:build_partition_spec</span>
+        </div>
+        <div class="status-row"><span class="bullet bullet-red"></span><span class="status-text">What to build: scope the overwrite scan to the incoming partition using Iceberg predicate pushdown; stop dropping + recreating the table; use <code>fast_append</code> to replace only that partition's files.</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Task 2: Position-delete files (MOR path) -->
+  <div class="task">
+    <div class="task-head">
+      <span class="task-icon">🗑️</span>
+      <div class="task-body">
+        <p class="task-title">Position-delete files (MOR path)</p>
+        <p class="task-desc">
+          The <code>EqualityDeleteFileWriterBuilder</code> and <code>EqualityDeleteWriterConfig</code> are already imported in <code>write_strategies.rs</code>. The module-level doc comment explains exactly why they can't be used yet: <code>fast_append</code> in iceberg-rust 0.9 validates <code>DataContentType::Data</code> only and rejects equality-delete files. The code structure for the future swap is already sketched out in the <code>WritePlan</code> struct (which carries a <code>delete_files: Vec&lt;DataFile&gt;</code> field).
+        </p>
+        <div class="tags">
+          <span class="tag tag-exists">✓ WritePlan.delete_files field ready</span>
+          <span class="tag tag-exists">✓ EqualityDeleteWriter imported</span>
+          <span class="tag tag-blocker">blocker: fast_append rejects delete content type</span>
+          <span class="tag tag-gap">✗ no row_delta / add_delete_files in 0.9</span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">
+          <span class="code-ref" onclick="sendPrompt('What is the iceberg-rust 0.9 roadmap for add_delete_files / row_delta support, and is there a way to commit EqualityDeleteFiles in 0.9 at all?')">iceberg-rust 0.9 Transaction API</span>
+          <span class="code-ref" onclick="sendPrompt('How should I structure the COW-to-MOR swap so the WritePlan.delete_files field is used when add_delete_files becomes available?')">write_strategies.rs:WritePlan</span>
+        </div>
+        <div class="status-row"><span class="bullet bullet-amber"></span><span class="status-text">What to build: keep COW for now; add a feature-flag code path that routes to MOR when <code>add_delete_files</code> lands upstream. The scaffolding (<code>WritePlan.delete_files</code>) is already in place.</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Task 3: Schema evolution drop + rename -->
+  <div class="task">
+    <div class="task-head">
+      <span class="task-icon">📋</span>
+      <div class="task-body">
+        <p class="task-title">Schema evolution: drop-column + rename</p>
+        <p class="task-desc">
+          <code>SchemaEvolutionConfig</code> in <code>config/mod.rs</code> currently has a single field: <code>allow_add_columns: bool</code>. The engine in <code>engine.rs:309</code> acts on this flag. The <code>UpdateSchema</code> transaction action needs to be called for drop and rename, but those fields don't exist on the config struct yet, and the engine has no branch for them.
+        </p>
+        <div class="tags">
+          <span class="tag tag-exists">✓ allow_add_columns implemented</span>
+          <span class="tag tag-gap">✗ allow_drop_columns missing</span>
+          <span class="tag tag-gap">✗ allow_rename_columns missing</span>
+          <span class="tag tag-gap">✗ no engine branch for drop/rename</span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">
+          <span class="code-ref" onclick="sendPrompt('Show me the SchemaEvolutionConfig struct and the engine.rs block at line 309 that handles allow_add_columns — what needs to be added for drop and rename?')">config/mod.rs:SchemaEvolutionConfig</span>
+          <span class="code-ref" onclick="sendPrompt('What UpdateSchema transaction actions does iceberg-rust 0.9 expose for dropping and renaming columns, and what are the API signatures?')">engine.rs:309 schema evolution</span>
+        </div>
+        <div class="status-row"><span class="bullet bullet-red"></span><span class="status-text">What to build: add <code>allow_drop_columns</code> and <code>allow_rename_columns: HashMap&lt;String, String&gt;</code> to <code>SchemaEvolutionConfig</code>; add corresponding <code>UpdateSchema</code> actions in the engine's schema-evolution block.</span></div>
+      </div>
+    </div>
+  </div>
+
+  <hr class="divider"/>
+
+  <div style="font-size:12px;color:var(--color-text-secondary);line-height:1.7">
+    <strong style="color:var(--color-text-primary)">Codebase snapshot</strong> — iceberg-rust 0.9 · Rust edition 2024<br>
+    <span class="bullet bullet-green" style="display:inline-block;vertical-align:middle"></span> <code>partition.rs</code>, <code>config/mod.rs</code> iceberg_partition, <code>WritePlan</code> struct — already solid.<br>
+    <span class="bullet bullet-red" style="display:inline-block;vertical-align:middle"></span> Overwrite COW + table drop-recreate and schema evolution fields — the two things to write first.
+  </div>
+</div>
