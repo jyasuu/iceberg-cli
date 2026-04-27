@@ -54,6 +54,7 @@ use iceberg::{
     spec::{
         // DataFileFormat,
         NestedField,
+        PartitionSpec,
         PrimitiveType,
         Schema as IcebergSchema,
         Transform,
@@ -383,12 +384,17 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
             let existing_spec = table.metadata().default_partition_spec();
             let preserved_spec: Option<UnboundPartitionSpec> = if !existing_spec.fields().is_empty()
             {
-                // Table already has a real partition spec — convert back to
-                // unbound so TableCreation can accept it.  The
-                // `From<PartitionSpec> for UnboundPartitionSpec` impl
-                // retains source_id, name, and transform for each field
-                // while setting field_id to None (catalog re-assigns).
-                let unbound: UnboundPartitionSpec = existing_spec.as_ref().clone().into();
+                // Reconstruct the UnboundPartitionSpec manually rather than
+                // using `From<PartitionSpec>`.  The `From` impl sets each
+                // field's `field_id` to `None`, which serde serialises as
+                // `"field-id": null`.  The Iceberg REST OpenAPI spec defines
+                // field-id as optional-but-not-nullable, so the Java REST
+                // server (Jackson) rejects `null` with:
+                //   JsonMappingException: Cannot parse to an integer value: field-id: null
+                // Preserving the existing field_id as `Some(id)` keeps the
+                // JSON well-formed.  We also set spec_id for the same reason
+                // (same `skip_serializing_if` omission on that field).
+                let unbound = unbound_spec_preserving_ids(existing_spec.as_ref());
                 Some(unbound)
             } else {
                 // No existing spec — build one from job config if available.
@@ -601,6 +607,34 @@ fn table_ident(namespace: &str, table: &str) -> Result<TableIdent> {
 
 // ── Partition spec builder ────────────────────────────────────────────────────
 
+/// Convert a bound [`PartitionSpec`] to an [`UnboundPartitionSpec`] while
+/// preserving both `spec_id` and each field's `field_id` as `Some(value)`.
+///
+/// The standard `From<PartitionSpec> for UnboundPartitionSpec` impl discards
+/// `field_id` (setting it to `None`), which causes serde to emit
+/// `"field-id": null`.  The Iceberg REST OpenAPI spec defines `field-id` as
+/// optional-but-not-nullable, so the Java REST server rejects `null` with a
+/// `JsonMappingException`.  This helper preserves both IDs so the serialized
+/// `CreateTableRequest` is well-formed.
+pub(crate) fn unbound_spec_preserving_ids(spec: &PartitionSpec) -> UnboundPartitionSpec {
+    let fields: Vec<UnboundPartitionField> = spec
+        .fields()
+        .iter()
+        .map(|f| UnboundPartitionField {
+            source_id: f.source_id,
+            field_id: Some(f.field_id), // preserve — must not serialise as null
+            name: f.name.clone(),
+            transform: f.transform,
+        })
+        .collect();
+
+    UnboundPartitionSpec::builder()
+        .with_spec_id(spec.spec_id())
+        .add_partition_fields(fields)
+        .expect("fields copied verbatim from a valid PartitionSpec; cannot fail")
+        .build()
+}
+
 /// Build an [`UnboundPartitionSpec`] for a single temporal column.
 ///
 /// Resolves the column name to its Iceberg field ID, selects the appropriate
@@ -657,10 +691,27 @@ pub(crate) fn build_partition_spec(
     // e.g. "sale_date_day", "event_ts_month".
     let field_name = format!("{column}_{transform_str}");
 
+    // `with_spec_id(0)` is required to avoid serializing `"spec-id": null` in
+    // the CreateTableRequest JSON.  The Iceberg REST OpenAPI spec defines
+    // spec-id as optional-but-not-nullable: if the key is present it must be
+    // an integer.  The Java REST server (Jackson) accepts an absent key but
+    // rejects `null`, throwing:
+    //   JsonMappingException: Cannot parse to an integer value: spec-id: null
+    // The underlying bug is that `UnboundPartitionSpec.spec_id` in iceberg-rust
+    // lacks `#[serde(skip_serializing_if = "Option::is_none")]`, so `None`
+    // becomes `null` instead of being omitted.  Until that is fixed upstream,
+    // explicitly setting spec-id to 0 (the conventional "unassigned" value)
+    // keeps the JSON well-formed and accepted by the server.
+    // `field_id: None` has the same missing `skip_serializing_if` bug as
+    // `spec_id`: serde emits `"field-id": null`, which the Java REST server
+    // rejects.  Use 1000, the conventional Iceberg starting field-id for
+    // user-defined partition fields (matches what the Java catalog assigns on
+    // first creation).  The server will re-assign the canonical id anyway.
     let spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
         .add_partition_fields(vec![UnboundPartitionField {
             source_id,
-            field_id: None, // assigned by the catalog
+            field_id: Some(1000),
             name: field_name,
             transform,
         }])
