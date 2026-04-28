@@ -805,8 +805,12 @@ async fn cmd_snapshots(catalog: &impl Catalog, table_str: &str, limit: usize) ->
     let current_id = meta.current_snapshot().map(|s| s.snapshot_id());
 
     let mut tbl = Table::new();
-    tbl.load_preset(UTF8_FULL)
-        .set_header(vec!["Snapshot ID", "Timestamp (UTC)", "Operation", "Current"]);
+    tbl.load_preset(UTF8_FULL).set_header(vec![
+        "Snapshot ID",
+        "Timestamp (UTC)",
+        "Operation",
+        "Current",
+    ]);
 
     for snap in snapshots.iter().take(limit) {
         let ts = chrono::DateTime::from_timestamp_millis(snap.timestamp_ms())
@@ -826,7 +830,10 @@ async fn cmd_snapshots(catalog: &impl Catalog, table_str: &str, limit: usize) ->
         ]);
     }
     println!("{tbl}");
-    println!("({} snapshots total, showing up to {limit})", snapshots.len());
+    println!(
+        "({} snapshots total, showing up to {limit})",
+        snapshots.len()
+    );
     Ok(())
 }
 
@@ -842,8 +849,8 @@ async fn cmd_expire_snapshots(
         .with_context(|| format!("load_table({table_str})"))?;
     let meta = table.metadata();
 
-    let cutoff_ms = (chrono::Utc::now() - chrono::Duration::days(older_than_days))
-        .timestamp_millis();
+    let cutoff_ms =
+        (chrono::Utc::now() - chrono::Duration::days(older_than_days)).timestamp_millis();
 
     let current_id = meta
         .current_snapshot()
@@ -893,7 +900,10 @@ async fn cmd_expire_snapshots(
         anyhow::bail!("Catalog returned {status}: {body}");
     }
 
-    println!("Expired {} snapshot(s) older than {older_than_days} day(s).", to_expire.len());
+    println!(
+        "Expired {} snapshot(s) older than {older_than_days} day(s).",
+        to_expire.len()
+    );
     Ok(())
 }
 
@@ -928,7 +938,8 @@ async fn cmd_table_stats(catalog: &impl Catalog, table_str: &str) -> Result<()> 
     let props = &summary.additional_properties;
     let get = |k: &str| props.get(k).map(|v: &String| v.as_str()).unwrap_or("—");
     let mut tbl = Table::new();
-    tbl.load_preset(UTF8_FULL).set_header(vec!["Metric", "Value"]);
+    tbl.load_preset(UTF8_FULL)
+        .set_header(vec!["Metric", "Value"]);
     tbl.add_row(vec!["Total data files", get("total-data-files")]);
     tbl.add_row(vec!["Total delete files", get("total-delete-files")]);
     tbl.add_row(vec!["Total records", get("total-records")]);
@@ -986,10 +997,7 @@ async fn cmd_add_column(catalog: &impl Catalog, table_str: &str, column_spec: &s
     let new_id = max_id + 1;
 
     // Build new schema: all existing fields + the new optional column
-    let mut new_fields: Vec<_> = current_schema
-        .as_struct()
-        .fields()
-        .to_vec();
+    let mut new_fields: Vec<_> = current_schema.as_struct().fields().to_vec();
     new_fields.push(NestedField::optional(new_id, col_name, Type::Primitive(ptype)).into());
 
     let new_schema = Schema::builder()
