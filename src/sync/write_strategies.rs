@@ -29,16 +29,28 @@
 //! To work within these API constraints we implement all write modes using
 //! **copy-on-write**:
 //!
+//! ### Overwrite (native partition spec)
+//!
+//! 1. Use Iceberg predicate pushdown (`scan().with_filter`) to read **only**
+//!    the target partition's rows — O(partition) instead of O(table).
+//! 2. Collect DataFile pointers for all other partitions from the manifest
+//!    without reading their rows (O(manifest) pointer copy).
+//! 3. COW-rewrite the target partition: survivors + incoming batch.
+//! 4. Commit (other-partition DataFiles) + (new target-partition DataFile)
+//!    via `fast_append` after drop+recreate.
+//!
+//! ### Upsert / MergeInto
+//!
 //! 1. Scan all existing rows from the current Iceberg snapshot.
 //! 2. Filter out the rows that the incoming batch logically replaces
-//!    (by partition column for Overwrite; by key columns for Upsert/MergeInto).
+//!    (by key columns).
 //! 3. Concatenate the surviving existing rows with the new/updated rows.
 //! 4. Write the merged result as fresh Parquet data files.
 //! 5. Commit only `DataContentType::Data` files via `fast_append`.
 //!
 //! This avoids delete files entirely and works within the iceberg-rust 0.9 API.
-//! The trade-off is a full table scan per batch for non-append modes, which is
-//! acceptable for the typical table sizes targeted by this tool.
+//! Overwrite with native partitioning is O(partition); upsert/merge_into remain
+//! O(table) since they require key-based deduplication across all partitions.
 use anyhow::{
     Context,
     Result, // , bail
@@ -49,16 +61,10 @@ use arrow_schema::DataType;
 use chrono;
 use futures::TryStreamExt;
 use iceberg::{
-    // expr::Reference,
+    expr::{Predicate, Reference},
     spec::{
-        DataFile,
-        DataFileFormat,
-        // Datum,
-        Literal,
-        PartitionKey,
-        PrimitiveType,
-        SchemaRef,
-        Struct,
+        DataContentType, DataFile, DataFileFormat, Datum, Literal, PartitionKey, PartitionSpec,
+        PrimitiveType, SchemaRef, Struct, Transform,
     },
     table::Table,
     transaction::{ApplyTransactionAction, Transaction},
@@ -126,18 +132,29 @@ pub async fn plan_append(job: &SyncJob, table: &Table, batch: RecordBatch) -> Re
 /// is resolved in priority order:
 ///
 /// 1. `job.iceberg_partition.column` — preferred; the table has a real Iceberg
-///    partition spec using a day/month/year/hour transform.
+///    partition spec using a day/month/year/hour transform.  When this is set
+///    the scan is **scoped to the target partition** via Iceberg predicate
+///    pushdown, avoiding a full-table row read.
 /// 2. `job.partition_column` — legacy fallback; used as a plain string equality
-///    filter with no native Iceberg partition spec on the table.
+///    filter with no native Iceberg partition spec on the table (full scan).
 ///
-/// ## Implementation (COW)
+/// ## Implementation (partition-scoped COW)
 ///
-/// 1. Scan all existing rows from the current Iceberg snapshot.
-/// 2. Remove rows whose `partition_column` value is present in the incoming
-///    batch (i.e. suppress old rows for the overwritten partition).
-/// 3. Concatenate surviving rows with the incoming batch.
-/// 4. Write the merged result as a fresh Parquet data file.
-/// 5. Commit only `DataContentType::Data` files via `fast_append`.
+/// When `iceberg_partition` is configured **and** the table already has a
+/// non-trivial partition spec (i.e. this is not the first run):
+///
+/// 1. Build an Iceberg predicate that matches only the target partition's
+///    column values (e.g. `sale_date IN ('2024-01-15', '2024-01-16')`).
+/// 2. Use `table.scan().with_filter(predicate)` to read **only** the rows
+///    belonging to the target partition — O(partition) instead of O(table).
+/// 3. Collect the DataFiles for **all other partitions** from the manifest
+///    without reading their rows (O(manifest) pointer copy).
+/// 4. Rewrite only the target partition: COW-filter old rows + append new rows.
+/// 5. Return (other-partition DataFiles) + (new target-partition DataFile) so
+///    the engine's drop+recreate commit produces a complete snapshot.
+///
+/// When `iceberg_partition` is **not** configured (legacy `partition_column`
+/// mode) the old full-table scan path is used unchanged.
 ///
 /// On first run (no existing snapshot) the behaviour is identical to a plain
 /// append, since there is nothing to scan.
@@ -160,20 +177,100 @@ pub async fn plan_overwrite(job: &SyncJob, table: &Table, batch: RecordBatch) ->
     let incoming_parts = extract_string_column_values(&batch, part_col)
         .context("Overwrite: failed to extract incoming partition values")?;
 
-    // COW overwrite: full table scan → drop rows for incoming partition(s)
-    // → concat survivors + incoming batch.
+    // ── Route: native Iceberg partition spec vs. legacy string-equality scan ──
     //
-    // Note: the engine drops and recreates the table after plan_overwrite
-    // returns (see engine.rs COW snapshot replacement block), so the plan
-    // must carry ALL surviving rows — not just the overwritten partition.
-    // A partition-scoped scan returning only the target partition's rows
-    // would cause every other partition's data to be silently lost.
+    // When `iceberg_partition` is configured and the table has a real partition
+    // spec we use predicate pushdown to scope the COW scan to the target
+    // partition only.  Other partitions' DataFiles are harvested from the
+    // manifest and carried through unchanged — no row reads required for them.
     //
-    // If the table has no snapshot yet this is the first run — plain append.
-    let merged = if table.metadata().current_snapshot().is_some() {
+    // The legacy path (partition_column only, no iceberg_partition) falls back
+    // to a full-table scan for backwards compatibility.
+    let use_native_partition = job.iceberg_partition.is_some()
+        && !table.metadata().default_partition_spec().is_unpartitioned();
+
+    if table.metadata().current_snapshot().is_none() {
+        // First run — no existing data, plain append.
+        debug!(job = %job.name, "overwrite: no existing snapshot — first run, plain append");
+        let rows_appended = batch.num_rows();
+        let data_files = write_parquet(job, table, batch)
+            .await
+            .context("Overwrite strategy: failed to write Parquet data (first run)")?;
+        return Ok(WritePlan {
+            data_files,
+            delete_files: vec![],
+            rows_appended,
+            rows_deleted: 0,
+        });
+    }
+
+    let (new_partition_file, untouched_files, rows_removed) = if use_native_partition {
+        // ── Native partition-scoped COW ───────────────────────────────────────
+        //
+        // Step 1: Build an Iceberg predicate for the incoming partition values.
+        // For a single value this is `col = value`; for multiple values we OR
+        // them together.  The scan executor uses the PartitionSpec to prune
+        // manifest entries before reading any Parquet, so only files that
+        // overlap the target partition are opened.
+        let predicate =
+            build_partition_predicate(part_col, &incoming_parts, table.metadata().current_schema())
+                .context("Overwrite: failed to build partition predicate for scan pushdown")?;
+
+        // Step 2: Scan only the target partition's rows.
+        let target_rows = scan_table_with_predicate(table, predicate)
+            .await
+            .context("Overwrite: failed to scan target partition rows")?;
+
+        // Step 3: Collect DataFiles for all OTHER partitions from the manifest.
+        // These are passed through unchanged — we never read their rows.
+        let untouched = collect_non_partition_files(table, part_col, &incoming_parts)
+            .await
+            .context("Overwrite: failed to collect non-target-partition DataFiles")?;
+
+        // Step 4: COW-filter the target partition's rows (drop any that are
+        // being replaced by the incoming batch), then concat with incoming.
+        let mut survivors: Vec<RecordBatch> = Vec::new();
+        let mut rows_removed = 0usize;
+        for existing_batch in target_rows {
+            let (kept, dropped) = partition_filter(&existing_batch, part_col, &incoming_parts)
+                .context("Overwrite: failed to filter target partition rows")?;
+            rows_removed += dropped;
+            if let Some(kept_batch) = kept {
+                survivors.push(kept_batch);
+            }
+        }
+
+        info!(
+            job = %job.name,
+            partition_col = part_col,
+            rows_removed,
+            rows_incoming = n,
+            untouched_files = untouched.len(),
+            "overwrite: partition-scoped COW — rewrote target partition only"
+        );
+
+        // Step 5: Write only the merged target-partition data as a new Parquet
+        // file.  Survivors may be empty if all old rows are being replaced.
+        survivors.push(batch);
+        let merged =
+            concat_batches_list(&survivors).context("Overwrite: failed to concatenate batches")?;
+        let new_files = write_parquet(job, table, merged)
+            .await
+            .context("Overwrite strategy: failed to write Parquet data (partition-scoped)")?;
+
+        (new_files, untouched, rows_removed)
+    } else {
+        // ── Legacy full-table scan (no native partition spec) ─────────────────
+        //
+        // For tables created without `iceberg_partition` (legacy
+        // `partition_column` only) we keep the original full-table COW scan.
+        // The comment in the old implementation noted that the engine's
+        // drop+recreate means the plan must carry ALL surviving rows.  That
+        // remains true here — untouched_files is empty because we read and
+        // rewrite everything inline.
         let existing = scan_table_to_batches(table)
             .await
-            .context("Overwrite: failed to scan existing table data")?;
+            .context("Overwrite: failed to scan existing table data (legacy path)")?;
 
         let mut survivors: Vec<RecordBatch> = Vec::new();
         let mut rows_removed = 0usize;
@@ -190,26 +287,234 @@ pub async fn plan_overwrite(job: &SyncJob, table: &Table, batch: RecordBatch) ->
             partition_col = part_col,
             rows_removed,
             rows_incoming = n,
-            "overwrite: COW — removed old partition rows, merging with incoming"
+            "overwrite: full-table COW (legacy partition_column path)"
         );
         survivors.push(batch);
-        concat_batches_list(&survivors).context("Overwrite: failed to concatenate batches")?
-    } else {
-        debug!(job = %job.name, "overwrite: no existing snapshot — first run, plain append");
-        batch
+        let merged =
+            concat_batches_list(&survivors).context("Overwrite: failed to concatenate batches")?;
+        let new_files = write_parquet(job, table, merged)
+            .await
+            .context("Overwrite strategy: failed to write Parquet data (legacy)")?;
+
+        (new_files, vec![], rows_removed)
     };
 
-    let rows_appended = merged.num_rows();
-    let data_files = write_parquet(job, table, merged)
-        .await
-        .context("Overwrite strategy: failed to write Parquet data")?;
+    // Combine the untouched other-partition files with the freshly written
+    // target-partition file(s).  The engine's drop+recreate then commits this
+    // complete set via fast_append, producing a correct new snapshot.
+    let mut all_data_files = untouched_files;
+    all_data_files.extend(new_partition_file);
+    let rows_appended = all_data_files
+        .iter()
+        .map(|f| f.record_count() as usize)
+        .sum();
 
     Ok(WritePlan {
-        data_files,
+        data_files: all_data_files,
         delete_files: vec![],
         rows_appended,
-        rows_deleted: n, // incoming rows replace old partition
+        rows_deleted: rows_removed,
     })
+}
+
+// ── Partition predicate helpers ───────────────────────────────────────────────
+
+/// Build an Iceberg [`Predicate`] that matches any row whose `col` value is in
+/// `values`.
+///
+/// `values` is a `HashSet<String>` produced by [`extract_string_column_values`]
+/// whose format depends on the Arrow column type:
+///
+/// | Arrow type | String format  | Datum constructor         |
+/// |------------|---------------|--------------------------|
+/// | Date32     | `"YYYY-MM-DD"` | `Datum::date_from_str`    |
+/// | Utf8       | raw string     | `Datum::string`           |
+/// | Int32      | decimal digits | `Datum::int`              |
+/// | Int64      | decimal digits | `Datum::long`             |
+///
+/// We look up the column's Iceberg field type from `schema` and dispatch to the
+/// correct constructor so the scan executor never has to coerce across types.
+/// The error `Can't convert datum from string type to date type` was caused by
+/// using `Datum::string` for a column that Iceberg knows as `date`.
+fn build_partition_predicate(
+    col: &str,
+    values: &std::collections::HashSet<String>,
+    schema: &iceberg::spec::Schema,
+) -> Result<Predicate> {
+    anyhow::ensure!(
+        !values.is_empty(),
+        "build_partition_predicate: incoming batch has no partition values for column '{col}'"
+    );
+
+    // Look up the Iceberg field type for this column so we emit the right Datum.
+    let field_type = schema
+        .field_by_name(col)
+        .with_context(|| {
+            format!("build_partition_predicate: column '{col}' not found in Iceberg schema")
+        })?
+        .field_type
+        .as_primitive_type()
+        .cloned();
+
+    let mut predicates: Vec<Predicate> = Vec::with_capacity(values.len());
+    for v in values {
+        let datum = match &field_type {
+            // Date columns: values are "YYYY-MM-DD" strings from scalar_to_string.
+            Some(PrimitiveType::Date) => Datum::date_from_str(v).with_context(|| {
+                format!(
+                    "build_partition_predicate: failed to parse date value '{v}' for column '{col}'"
+                )
+            })?,
+
+            // Integer columns: parse and emit the right width.
+            Some(PrimitiveType::Int) => {
+                let n: i32 = v.parse().with_context(|| {
+                    format!(
+                        "build_partition_predicate: failed to parse int value '{v}' for column '{col}'"
+                    )
+                })?;
+                Datum::int(n)
+            }
+
+            // Long / Timestamp / TimestampTz: parse as i64.
+            Some(PrimitiveType::Long)
+            | Some(PrimitiveType::Timestamp)
+            | Some(PrimitiveType::Timestamptz) => {
+                let n: i64 = v.parse().with_context(|| {
+                    format!(
+                        "build_partition_predicate: failed to parse long value '{v}' for column '{col}'"
+                    )
+                })?;
+                Datum::long(n)
+            }
+
+            // Float / Double.
+            Some(PrimitiveType::Float) => {
+                let f: f32 = v.parse().with_context(|| {
+                    format!(
+                        "build_partition_predicate: failed to parse float value '{v}' for column '{col}'"
+                    )
+                })?;
+                Datum::float(f)
+            }
+            Some(PrimitiveType::Double) => {
+                let d: f64 = v.parse().with_context(|| {
+                    format!(
+                        "build_partition_predicate: failed to parse double value '{v}' for column '{col}'"
+                    )
+                })?;
+                Datum::double(d)
+            }
+
+            // Boolean.
+            Some(PrimitiveType::Boolean) => {
+                let b: bool = v.parse().with_context(|| {
+                    format!(
+                        "build_partition_predicate: failed to parse boolean value '{v}' for column '{col}'"
+                    )
+                })?;
+                Datum::bool(b)
+            }
+
+            // String and everything else (UUID, Fixed, Binary, Decimal): treat as string.
+            Some(PrimitiveType::String) => Datum::string(v.clone()),
+            None => Datum::string(v.clone()),
+            _ => Datum::string(v.clone()),
+        };
+        predicates.push(Reference::new(col).equal_to(datum));
+    }
+
+    // Fold into a single OR predicate.
+    let combined = predicates
+        .into_iter()
+        .reduce(|acc, p| acc.or(p))
+        .expect("non-empty predicates; reduce always succeeds");
+
+    Ok(combined)
+}
+
+/// Scan only the rows that satisfy `predicate` using Iceberg's native predicate
+/// pushdown.  The scan engine prunes manifests using the PartitionSpec before
+/// opening any Parquet file, so only files that might contain matching rows are
+/// read.
+async fn scan_table_with_predicate(
+    table: &Table,
+    predicate: Predicate,
+) -> Result<Vec<RecordBatch>> {
+    let scan = table
+        .scan()
+        .with_filter(predicate)
+        .build()
+        .context("partition-scoped scan: failed to build filtered table scan")?;
+
+    let stream = scan
+        .to_arrow()
+        .await
+        .context("partition-scoped scan: failed to open Arrow stream")?;
+
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .context("partition-scoped scan: failed to collect Arrow batches")?;
+
+    Ok(batches)
+}
+
+/// Walk the current snapshot's manifest list and collect [`DataFile`]s whose
+/// partition value for `partition_col` is **not** in `target_values`.
+///
+/// These are the files that belong to partitions other than the one being
+/// overwritten.  They are returned as opaque pointers and carried into the new
+/// snapshot via `fast_append` after the drop+recreate, so their rows are never
+/// read.
+///
+/// Files with `DataContentType` other than `Data` (e.g. equality-delete files)
+/// are skipped because `fast_append` only accepts data files.
+async fn collect_non_partition_files(
+    table: &Table,
+    partition_col: &str,
+    target_values: &std::collections::HashSet<String>,
+) -> Result<Vec<DataFile>> {
+    let snapshot = match table.metadata().current_snapshot() {
+        Some(s) => s,
+        None => return Ok(vec![]),
+    };
+
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), &table.metadata_ref())
+        .await
+        .context("collect_non_partition_files: failed to load manifest list")?;
+
+    let mut files: Vec<DataFile> = Vec::new();
+
+    for manifest_entry in manifest_list.entries() {
+        let manifest = manifest_entry
+            .load_manifest(table.file_io())
+            .await
+            .context("collect_non_partition_files: failed to load manifest")?;
+
+        for entry in manifest.entries() {
+            let df = entry.data_file();
+
+            // Only carry forward data files — fast_append rejects delete files.
+            if df.content_type() != DataContentType::Data {
+                continue;
+            }
+
+            // Check whether this file belongs to the target partition.
+            // We pass the bound PartitionSpec and table schema so that
+            // partition_matches can resolve the transform (Day/Month/Year/Hour)
+            // for each partition field and format literals correctly — no
+            // range heuristics required.
+            let spec = table.metadata().default_partition_spec();
+            let schema = table.metadata().current_schema();
+            if !partition_matches(df.partition(), partition_col, target_values, spec, schema) {
+                files.push(df.clone());
+            }
+        }
+    }
+
+    Ok(files)
 }
 
 // ── Upsert ────────────────────────────────────────────────────────────────────
@@ -970,14 +1275,16 @@ async fn collect_partition_files(
 
         for entry in manifest.entries() {
             let df = entry.data_file();
-            if df.content_type() != iceberg::spec::DataContentType::Data {
+            if df.content_type() != DataContentType::Data {
                 continue;
             }
 
             // Check if the partition record contains our target column value.
             // The partition record is a Struct; we compare its fields by name.
             let partition = df.partition();
-            let matches = partition_matches(partition, partition_col, part_values);
+            let spec = table.metadata().default_partition_spec();
+            let schema = table.metadata().current_schema();
+            let matches = partition_matches(partition, partition_col, part_values, spec, schema);
             if matches {
                 files.push(df.clone());
             }
@@ -987,25 +1294,155 @@ async fn collect_partition_files(
     Ok(files)
 }
 
-/// Returns true if the partition record contains a value for `col` that is in
-/// `part_values`.  Falls back to `true` (match all) for unpartitioned tables
-/// (empty partition record).
-#[allow(dead_code)]
+/// Returns true if the partition [`Struct`] of a DataFile contains a value for
+/// any partition field that matches one of `values`.
+///
+/// This is used by [`collect_non_partition_files`] to identify files belonging
+/// to the target partition that is being overwritten.  Files that match are
+/// excluded from the untouched-files list (they belong to the target partition
+/// and will be replaced by the COW rewrite).  Files that do not match are
+/// returned as untouched.
+///
+/// For an unpartitioned table (empty partition struct) no files are excluded
+/// because there is no partition boundary — in that case the caller should not
+/// be using this function.
+///
+/// ## Matching strategy
+///
+/// The Iceberg [`Struct`] stores partition values as `Option<Literal>`.  The
+/// bound [`PartitionSpec`] tells us the `Transform` for each field (Day, Month,
+/// Year, Hour, Identity, …), which we use to format each literal into the same
+/// canonical string that [`scalar_to_string`] produces for the source Arrow
+/// column — no range heuristics required.
 fn partition_matches(
     partition: &iceberg::spec::Struct,
     _col: &str,
     values: &std::collections::HashSet<String>,
+    spec: &PartitionSpec,
+    schema: &iceberg::spec::Schema,
 ) -> bool {
-    // An unpartitioned table has an empty partition struct — match all files.
+    // An unpartitioned table has an empty partition struct — conservatively
+    // match (caller should not include these in untouched files).
     if partition.fields().is_empty() {
         return true;
     }
 
-    // We can't easily look up by name in iceberg::spec::Struct; we convert the
-    // debug representation to a string as a best-effort fallback.
-    // For production use, the partition spec schema would be consulted here.
-    let repr = format!("{partition:?}");
-    values.iter().any(|v| repr.contains(v.as_str()))
+    // Zip the DataFile's partition struct fields with the PartitionSpec fields
+    // so we know the Transform for each position.
+    for (lit_opt, part_field) in partition.fields().iter().zip(spec.fields().iter()) {
+        // Resolve the source column's Iceberg type so we can format correctly.
+        let source_type = schema
+            .field_by_id(part_field.source_id)
+            .and_then(|f| f.field_type.as_primitive_type().cloned());
+
+        let lit_str = match lit_opt {
+            Some(iceberg::spec::Literal::Primitive(prim)) => {
+                literal_primitive_to_string(prim, &part_field.transform, source_type.as_ref())
+            }
+            Some(_) => continue, // non-primitive partition literals — skip
+            None => continue,    // null partition value — skip
+        };
+        if values.contains(&lit_str) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Convert an Iceberg [`PrimitiveLiteral`] to the same canonical string format
+/// used by [`scalar_to_string`] so that the two ends of the matching pipeline
+/// produce identical strings.
+///
+/// The `transform` parameter — taken from the bound [`PartitionSpec`] — is the
+/// authoritative source of truth for how the literal should be interpreted.
+/// No range heuristics are used: `Transform::Day` always means days-since-epoch
+/// → "YYYY-MM-DD", `Transform::Month` → "YYYY-MM", etc.  The `source_type` is
+/// only needed for `Transform::Identity` to distinguish a plain `Int` column
+/// from a `Date` column whose wire value is also stored as `Int(days)`.
+fn literal_primitive_to_string(
+    prim: &iceberg::spec::PrimitiveLiteral,
+    transform: &Transform,
+    source_type: Option<&PrimitiveType>,
+) -> String {
+    use iceberg::spec::PrimitiveLiteral;
+
+    /// Format days-since-epoch as "YYYY-MM-DD", matching scalar_to_string's Date32 output.
+    fn days_to_date_str(days: i64) -> String {
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        match epoch.checked_add_signed(chrono::Duration::days(days)) {
+            Some(d) => d.format("%Y-%m-%d").to_string(),
+            None => days.to_string(),
+        }
+    }
+
+    /// Format months-since-epoch as "YYYY-MM".
+    fn months_to_month_str(months: i64) -> String {
+        let total_months = 1970 * 12 + months;
+        let year = total_months.div_euclid(12);
+        let month = total_months.rem_euclid(12) + 1;
+        format!("{year:04}-{month:02}")
+    }
+
+    /// Format years-since-epoch as "YYYY".
+    fn years_to_year_str(years: i64) -> String {
+        format!("{:04}", 1970 + years)
+    }
+
+    match transform {
+        // Day transform: partition value is Int (days since epoch).
+        // scalar_to_string formats Date32 as "YYYY-MM-DD" — match that exactly.
+        Transform::Day => match prim {
+            PrimitiveLiteral::Int(v) => days_to_date_str(*v as i64),
+            PrimitiveLiteral::Long(v) => days_to_date_str(*v),
+            _ => format!("{prim:?}"),
+        },
+
+        Transform::Month => match prim {
+            PrimitiveLiteral::Int(v) => months_to_month_str(*v as i64),
+            PrimitiveLiteral::Long(v) => months_to_month_str(*v),
+            _ => format!("{prim:?}"),
+        },
+
+        Transform::Year => match prim {
+            PrimitiveLiteral::Int(v) => years_to_year_str(*v as i64),
+            PrimitiveLiteral::Long(v) => years_to_year_str(*v),
+            _ => format!("{prim:?}"),
+        },
+
+        // Hour: raw integer (hours since epoch).
+        Transform::Hour => match prim {
+            PrimitiveLiteral::Int(v) => v.to_string(),
+            PrimitiveLiteral::Long(v) => v.to_string(),
+            _ => format!("{prim:?}"),
+        },
+
+        // Identity: the partition value IS the source value — use the source
+        // column type to decide how to format it.
+        Transform::Identity => match (prim, source_type) {
+            (PrimitiveLiteral::Int(v), Some(PrimitiveType::Date)) => days_to_date_str(*v as i64),
+            (PrimitiveLiteral::Long(v), Some(PrimitiveType::Date)) => days_to_date_str(*v),
+            (PrimitiveLiteral::Boolean(b), _) => b.to_string(),
+            (PrimitiveLiteral::Int(v), _) => v.to_string(),
+            (PrimitiveLiteral::Long(v), _) => v.to_string(),
+            (PrimitiveLiteral::Float(f), _) => f.to_string(),
+            (PrimitiveLiteral::Double(d), _) => d.to_string(),
+            (PrimitiveLiteral::String(s), _) => s.clone(),
+            (PrimitiveLiteral::Int128(v), _) => v.to_string(),
+            (PrimitiveLiteral::UInt128(v), _) => v.to_string(),
+            (PrimitiveLiteral::AboveMax, _) => "AboveMax".to_string(),
+            (PrimitiveLiteral::BelowMin, _) => "BelowMin".to_string(),
+            (PrimitiveLiteral::Binary(_), _) => String::new(),
+        },
+
+        // Bucket / Truncate / Void / unknown: opaque integer — emit raw value.
+        _ => match prim {
+            PrimitiveLiteral::Int(v) => v.to_string(),
+            PrimitiveLiteral::Long(v) => v.to_string(),
+            PrimitiveLiteral::String(s) => s.clone(),
+            _ => format!("{prim:?}"),
+        },
+    }
 }
 
 // ── _op split ────────────────────────────────────────────────────────────────

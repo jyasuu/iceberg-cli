@@ -349,20 +349,36 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         //
         // `fast_append` always stacks new manifest entries *on top of* the
         // existing snapshot's manifest list.  For copy-on-write modes the plan
-        // has already merged surviving + new rows into a single fresh Parquet
-        // file.  If we just fast-appended that file the old data files would
-        // remain in the snapshot, causing duplicate rows.
+        // has already merged surviving + new rows into fresh Parquet files.
+        // If we just fast-appended those files the old data files would remain
+        // in the snapshot, causing duplicate rows.
         //
         // Work-around within the iceberg-rust 0.9 API (which exposes only
         // `fast_append`): drop the table and recreate it with the same schema
         // and properties before committing, so the new snapshot starts from an
-        // empty manifest list.  The COW merged file then becomes the one-and-only
-        // data file in the fresh snapshot.
+        // empty manifest list.  The plan's DataFiles then become the complete
+        // set of files in the fresh snapshot.
         //
-        // This is safe because the COW plan already contains all surviving rows.
-        let table = if job.write_mode != WriteMode::Append
-            && table.metadata().current_snapshot().is_some()
-        {
+        // ## Native-partition overwrite exception
+        //
+        // When `plan_overwrite` runs with a real Iceberg partition spec it
+        // returns the COMPLETE set of DataFiles needed for the new snapshot:
+        //   - the freshly written target-partition file(s), AND
+        //   - the existing DataFile pointers for all other partitions
+        //     (collected from the manifest without reading their rows).
+        //
+        // This means drop+recreate is still required to clear the old snapshot,
+        // but the other-partition files are passed through as opaque DataFile
+        // pointers — no row reads — so the partition layout is fully preserved.
+        //
+        // For upsert and merge_into the plan always contains all surviving rows
+        // rewritten as a single file, so the same drop+recreate logic applies.
+        //
+        // Append never needs drop+recreate (it stacks on top correctly).
+        let needs_cow_replace =
+            job.write_mode != WriteMode::Append && table.metadata().current_snapshot().is_some();
+
+        let table = if needs_cow_replace {
             // Preserve schema and existing metadata properties (watermarks, etc.)
             // across the drop+recreate so we don't lose commit history metadata.
             let preserved_schema = table.metadata().current_schema().clone();
