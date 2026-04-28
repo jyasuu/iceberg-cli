@@ -219,6 +219,103 @@ enum Commands {
         #[arg(long)]
         table: String,
     },
+
+    /// Rename a table within the catalog
+    RenameTable {
+        /// Source fully-qualified table: namespace.table
+        #[arg(long)]
+        from: String,
+        /// Destination fully-qualified table: namespace.table
+        #[arg(long)]
+        to: String,
+    },
+
+    /// Count the total number of rows in a table
+    Count {
+        /// Fully-qualified table: namespace.table
+        #[arg(long)]
+        table: String,
+    },
+
+    /// List snapshots for a table (most recent first)
+    Snapshots {
+        /// Fully-qualified table: namespace.table
+        #[arg(long)]
+        table: String,
+        /// Maximum number of snapshots to display (default: 20)
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Expire snapshots older than N days (keeps the current snapshot)
+    ExpireSnapshots {
+        /// Fully-qualified table: namespace.table
+        #[arg(long)]
+        table: String,
+        /// Expire snapshots older than this many days
+        #[arg(long, default_value = "7")]
+        older_than_days: i64,
+    },
+
+    /// Show file-level statistics for a table (snapshot, file count, total size, row count)
+    TableStats {
+        /// Fully-qualified table: namespace.table
+        #[arg(long)]
+        table: String,
+    },
+
+    /// Add a column to an existing table
+    AddColumn {
+        /// Fully-qualified table: namespace.table
+        #[arg(long)]
+        table: String,
+        /// Column spec: "name:type" (same types as create-table)
+        #[arg(long)]
+        column: String,
+    },
+
+    /// Drop a column from an existing table
+    DropColumn {
+        /// Fully-qualified table: namespace.table
+        #[arg(long)]
+        table: String,
+        /// Column name to remove
+        #[arg(long)]
+        column: String,
+    },
+
+    /// Show or update namespace-level properties
+    NamespaceProperties {
+        /// Namespace to inspect or update
+        #[arg(long)]
+        namespace: String,
+        /// Set a property as "key=value" (can be repeated)
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        /// Remove a property key (can be repeated)
+        #[arg(long = "remove", value_name = "KEY")]
+        remove: Vec<String>,
+    },
+
+    /// Drop a namespace (must be empty)
+    DropNamespace {
+        /// Namespace to drop
+        #[arg(long)]
+        namespace: String,
+    },
+
+    /// Copy all data from one table into another via fast-append (schemas must match)
+    CopyTable {
+        /// Source fully-qualified table: namespace.table
+        #[arg(long)]
+        from: String,
+        /// Destination fully-qualified table: namespace.table
+        #[arg(long)]
+        to: String,
+        /// Max rows to copy (default: all)
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -267,6 +364,25 @@ async fn main() -> Result<()> {
             cmd_create_table(&catalog, table, schema).await?
         }
         Commands::DropTable { table } => cmd_drop_table(&catalog, table).await?,
+        Commands::RenameTable { from, to } => cmd_rename_table(&catalog, from, to).await?,
+        Commands::Count { table } => cmd_count(&catalog, table).await?,
+        Commands::Snapshots { table, limit } => cmd_snapshots(&catalog, table, *limit).await?,
+        Commands::ExpireSnapshots {
+            table,
+            older_than_days,
+        } => cmd_expire_snapshots(&catalog, table, *older_than_days).await?,
+        Commands::TableStats { table } => cmd_table_stats(&catalog, table).await?,
+        Commands::AddColumn { table, column } => cmd_add_column(&catalog, table, column).await?,
+        Commands::DropColumn { table, column } => cmd_drop_column(&catalog, table, column).await?,
+        Commands::NamespaceProperties {
+            namespace,
+            set,
+            remove,
+        } => cmd_namespace_properties(&catalog, namespace, set, remove).await?,
+        Commands::DropNamespace { namespace } => cmd_drop_namespace(&catalog, namespace).await?,
+        Commands::CopyTable { from, to, limit } => {
+            cmd_copy_table(&catalog, from, to, *limit).await?
+        }
         Commands::Sync {
             config,
             job,
@@ -632,6 +748,542 @@ async fn cmd_create_table(catalog: &impl Catalog, table_str: &str, schema_str: &
             }
         }
     }
+    Ok(())
+}
+
+// ─── New commands ─────────────────────────────────────────────────────────────
+
+async fn cmd_rename_table(catalog: &impl Catalog, from_str: &str, to_str: &str) -> Result<()> {
+    let src = parse_table(from_str)?;
+    let dst = parse_table(to_str)?;
+    catalog
+        .rename_table(&src, &dst)
+        .await
+        .with_context(|| format!("rename_table({from_str} → {to_str})"))?;
+    println!("Renamed '{from_str}' → '{to_str}'.");
+    Ok(())
+}
+
+async fn cmd_count(catalog: &impl Catalog, table_str: &str) -> Result<()> {
+    let ident = parse_table(table_str)?;
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .with_context(|| format!("load_table({table_str})"))?;
+
+    let stream = table
+        .scan()
+        .build()
+        .context("build scan")?
+        .to_arrow()
+        .await
+        .context("to_arrow")?;
+
+    let batches: Vec<RecordBatch> = stream.try_collect().await.context("collect batches")?;
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    println!("{total} rows in '{table_str}'.");
+    Ok(())
+}
+
+async fn cmd_snapshots(catalog: &impl Catalog, table_str: &str, limit: usize) -> Result<()> {
+    let ident = parse_table(table_str)?;
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .with_context(|| format!("load_table({table_str})"))?;
+    let meta = table.metadata();
+
+    let mut snapshots: Vec<_> = meta.snapshots().collect();
+    // Most recent first
+    snapshots.sort_by_key(|b| std::cmp::Reverse(b.timestamp_ms()));
+
+    if snapshots.is_empty() {
+        println!("(no snapshots — table is empty)");
+        return Ok(());
+    }
+
+    let current_id = meta.current_snapshot().map(|s| s.snapshot_id());
+
+    let mut tbl = Table::new();
+    tbl.load_preset(UTF8_FULL)
+        .set_header(vec!["Snapshot ID", "Timestamp (UTC)", "Operation", "Current"]);
+
+    for snap in snapshots.iter().take(limit) {
+        let ts = chrono::DateTime::from_timestamp_millis(snap.timestamp_ms())
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| snap.timestamp_ms().to_string());
+        let op = format!("{:?}", snap.summary().operation);
+        let is_current = if current_id == Some(snap.snapshot_id()) {
+            "✓"
+        } else {
+            ""
+        };
+        tbl.add_row(vec![
+            snap.snapshot_id().to_string(),
+            ts,
+            op,
+            is_current.to_string(),
+        ]);
+    }
+    println!("{tbl}");
+    println!("({} snapshots total, showing up to {limit})", snapshots.len());
+    Ok(())
+}
+
+async fn cmd_expire_snapshots(
+    catalog: &impl Catalog,
+    table_str: &str,
+    older_than_days: i64,
+) -> Result<()> {
+    let ident = parse_table(table_str)?;
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .with_context(|| format!("load_table({table_str})"))?;
+    let meta = table.metadata();
+
+    let cutoff_ms = (chrono::Utc::now() - chrono::Duration::days(older_than_days))
+        .timestamp_millis();
+
+    let current_id = meta
+        .current_snapshot()
+        .map(|s| s.snapshot_id())
+        .ok_or_else(|| anyhow::anyhow!("Table '{table_str}' has no current snapshot"))?;
+
+    // Identify snapshots to expire (older than cutoff, not current)
+    let to_expire: Vec<i64> = meta
+        .snapshots()
+        .filter(|s| s.snapshot_id() != current_id && s.timestamp_ms() < cutoff_ms)
+        .map(|s| s.snapshot_id())
+        .collect();
+
+    if to_expire.is_empty() {
+        println!("No snapshots older than {older_than_days} days to expire.");
+        return Ok(());
+    }
+
+    // Use the REST catalog's update-table endpoint with a RemoveSnapshots update.
+    // iceberg-rust 0.9.0 Transaction does not expose a snapshot-expiry action,
+    // but TableUpdate::RemoveSnapshots is part of the Iceberg REST spec.
+    let uri = std::env::var("ICEBERG_URI").unwrap_or_else(|_| "http://localhost:8181".to_string());
+    let ns = ident.namespace().to_url_string();
+    let tbl_name = ident.name();
+    let url = format!("{uri}/v1/namespaces/{ns}/tables/{tbl_name}");
+
+    let payload = serde_json::json!({
+        "requirements": [],
+        "updates": [
+            {
+                "action": "remove-snapshots",
+                "snapshot-ids": to_expire
+            }
+        ]
+    });
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .context("POST update-table (remove-snapshots)")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Catalog returned {status}: {body}");
+    }
+
+    println!("Expired {} snapshot(s) older than {older_than_days} day(s).", to_expire.len());
+    Ok(())
+}
+
+async fn cmd_table_stats(catalog: &impl Catalog, table_str: &str) -> Result<()> {
+    let ident = parse_table(table_str)?;
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .with_context(|| format!("load_table({table_str})"))?;
+    let meta = table.metadata();
+
+    let snap = match meta.current_snapshot() {
+        Some(s) => s,
+        None => {
+            println!("Table '{table_str}' has no snapshots (empty table).");
+            return Ok(());
+        }
+    };
+
+    // summary() returns &Summary (never None) in iceberg 0.9
+    let summary = snap.summary();
+
+    println!("━━━  Table Stats: {table_str}  ━━━");
+    println!("  Snapshot ID     : {}", snap.snapshot_id());
+
+    let ts = chrono::DateTime::from_timestamp_millis(snap.timestamp_ms())
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| snap.timestamp_ms().to_string());
+    println!("  Snapshot time   : {ts}");
+    println!("  Operation       : {:?}", summary.operation);
+
+    let props = &summary.additional_properties;
+    let get = |k: &str| props.get(k).map(|v: &String| v.as_str()).unwrap_or("—");
+    let mut tbl = Table::new();
+    tbl.load_preset(UTF8_FULL).set_header(vec!["Metric", "Value"]);
+    tbl.add_row(vec!["Total data files", get("total-data-files")]);
+    tbl.add_row(vec!["Total delete files", get("total-delete-files")]);
+    tbl.add_row(vec!["Total records", get("total-records")]);
+    tbl.add_row(vec!["Total file size (bytes)", get("total-files-size")]);
+    tbl.add_row(vec!["Added files", get("added-data-files")]);
+    tbl.add_row(vec!["Added records", get("added-records")]);
+    tbl.add_row(vec!["Deleted records", get("deleted-records")]);
+    println!("{tbl}");
+    Ok(())
+}
+
+async fn cmd_add_column(catalog: &impl Catalog, table_str: &str, column_spec: &str) -> Result<()> {
+    let ident = parse_table(table_str)?;
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .with_context(|| format!("load_table({table_str})"))?;
+
+    // Parse and validate the column spec "name:type" up front
+    let parts: Vec<&str> = column_spec.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("Expected 'name:type', got '{column_spec}'");
+    }
+    let col_name = parts[0].trim();
+    let col_type_str = parts[1].trim();
+
+    use iceberg::spec::{NestedField, PrimitiveType as PT, Type};
+    let ptype = match col_type_str.to_lowercase().as_str() {
+        "long" | "int64" => PT::Long,
+        "int" | "int32" => PT::Int,
+        "string" | "str" => PT::String,
+        "double" | "float64" => PT::Double,
+        "float" | "float32" => PT::Float,
+        "boolean" | "bool" => PT::Boolean,
+        "date" => PT::Date,
+        "timestamp" => PT::Timestamp,
+        other => anyhow::bail!("Unknown column type '{other}'"),
+    };
+
+    let current_schema = table.metadata().current_schema();
+
+    // Guard: column must not already exist
+    if current_schema.field_by_name(col_name).is_some() {
+        anyhow::bail!("Column '{col_name}' already exists in '{table_str}'");
+    }
+
+    // Assign next field ID
+    let max_id = current_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| f.id)
+        .max()
+        .unwrap_or(0);
+    let new_id = max_id + 1;
+
+    // Build new schema: all existing fields + the new optional column
+    let mut new_fields: Vec<_> = current_schema
+        .as_struct()
+        .fields()
+        .to_vec();
+    new_fields.push(NestedField::optional(new_id, col_name, Type::Primitive(ptype)).into());
+
+    let new_schema = Schema::builder()
+        .with_fields(new_fields)
+        .with_schema_id(current_schema.schema_id() + 1)
+        .build()
+        .context("build updated schema")?;
+
+    // Commit via the REST catalog directly: POST /v1/namespaces/{ns}/tables/{tbl}
+    // with an UpdateTableRequest that adds an AddSchemaUpdate + SetCurrentSchemaUpdate.
+    // iceberg-rust 0.9.0 Transaction does not expose a schema-evolution action, so we
+    // call the REST endpoint ourselves using reqwest.
+    let uri = std::env::var("ICEBERG_URI").unwrap_or_else(|_| "http://localhost:8181".to_string());
+    let ns = ident.namespace().to_url_string();
+    let tbl = ident.name();
+    let url = format!("{uri}/v1/namespaces/{ns}/tables/{tbl}");
+
+    let schema_json = serde_json::to_value(&new_schema).context("serialize schema")?;
+    let payload = serde_json::json!({
+        "requirements": [{ "type": "assert-current-schema-id", "current-schema-id": current_schema.schema_id() }],
+        "updates": [
+            { "action": "add-schema", "schema": schema_json, "last-column-id": new_id },
+            { "action": "set-current-schema", "schema-id": -1 }
+        ]
+    });
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .context("POST update-table")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Catalog returned {status}: {body}");
+    }
+
+    println!("Added column '{col_name}' ({col_type_str}) to '{table_str}'.");
+    Ok(())
+}
+
+async fn cmd_drop_column(catalog: &impl Catalog, table_str: &str, column: &str) -> Result<()> {
+    let ident = parse_table(table_str)?;
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .with_context(|| format!("load_table({table_str})"))?;
+
+    let current_schema = table.metadata().current_schema();
+
+    // Verify the column exists
+    if current_schema.field_by_name(column).is_none() {
+        anyhow::bail!("Column '{column}' does not exist in '{table_str}'");
+    }
+
+    let remaining: Vec<_> = current_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .filter(|f| f.name != column)
+        .cloned()
+        .collect();
+
+    if remaining.is_empty() {
+        anyhow::bail!("Cannot drop the only column in '{table_str}'");
+    }
+
+    let max_id = remaining.iter().map(|f| f.id).max().unwrap_or(0);
+    let new_schema = Schema::builder()
+        .with_fields(remaining)
+        .with_schema_id(current_schema.schema_id() + 1)
+        .build()
+        .context("build updated schema")?;
+
+    // Same direct REST call as add-column (iceberg-rust 0.9 Transaction has no
+    // schema-evolution action).
+    let uri = std::env::var("ICEBERG_URI").unwrap_or_else(|_| "http://localhost:8181".to_string());
+    let ns = ident.namespace().to_url_string();
+    let tbl = ident.name();
+    let url = format!("{uri}/v1/namespaces/{ns}/tables/{tbl}");
+
+    let schema_json = serde_json::to_value(&new_schema).context("serialize schema")?;
+    let payload = serde_json::json!({
+        "requirements": [{ "type": "assert-current-schema-id", "current-schema-id": current_schema.schema_id() }],
+        "updates": [
+            { "action": "add-schema", "schema": schema_json, "last-column-id": max_id },
+            { "action": "set-current-schema", "schema-id": -1 }
+        ]
+    });
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .context("POST update-table")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Catalog returned {status}: {body}");
+    }
+
+    println!("Dropped column '{column}' from '{table_str}'.");
+    Ok(())
+}
+
+async fn cmd_namespace_properties(
+    catalog: &impl Catalog,
+    namespace: &str,
+    set: &[String],
+    remove: &[String],
+) -> Result<()> {
+    let ns = parse_namespace(namespace)?;
+
+    if set.is_empty() && remove.is_empty() {
+        // Read-only: display current properties
+        let props = catalog
+            .get_namespace(&ns)
+            .await
+            .with_context(|| format!("get_namespace({namespace})"))?
+            .properties()
+            .clone();
+
+        if props.is_empty() {
+            println!("(no properties on namespace '{namespace}')");
+        } else {
+            let mut tbl = Table::new();
+            tbl.load_preset(UTF8_FULL).set_header(vec!["Key", "Value"]);
+            for (k, v) in &props {
+                tbl.add_row(vec![k, v]);
+            }
+            println!("{tbl}");
+        }
+        return Ok(());
+    }
+
+    // In iceberg 0.9 update_namespace only accepts updates (HashMap); there is no
+    // separate removals argument. To "remove" a key we omit it from the new map —
+    // the catalog will replace the property set with whatever we send.
+    // First fetch current props so we can merge intelligently.
+    let mut current = catalog
+        .get_namespace(&ns)
+        .await
+        .with_context(|| format!("get_namespace({namespace})"))?
+        .properties()
+        .clone();
+
+    // Apply removals
+    for key in remove {
+        current.remove(key.as_str());
+    }
+    // Apply updates (overwrite / insert)
+    for kv in set {
+        let parts: Vec<&str> = kv.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            anyhow::bail!("Expected 'key=value', got '{kv}'");
+        }
+        current.insert(parts[0].to_string(), parts[1].to_string());
+    }
+
+    catalog
+        .update_namespace(&ns, current)
+        .await
+        .with_context(|| format!("update_namespace({namespace})"))?;
+
+    println!("Updated properties for namespace '{namespace}'.");
+    Ok(())
+}
+
+async fn cmd_drop_namespace(catalog: &impl Catalog, namespace: &str) -> Result<()> {
+    let ns = parse_namespace(namespace)?;
+    match catalog.drop_namespace(&ns).await {
+        Ok(_) => println!("Dropped namespace '{namespace}'."),
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("does not exist") || msg.contains("not found") {
+                println!("Namespace '{namespace}' does not exist — skipping.");
+            } else {
+                return Err(e).with_context(|| format!("drop_namespace({namespace})"));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_copy_table(
+    catalog: &impl Catalog,
+    from_str: &str,
+    to_str: &str,
+    limit: Option<usize>,
+) -> Result<()> {
+    // Load source
+    let src_ident = parse_table(from_str)?;
+    let src_table = catalog
+        .load_table(&src_ident)
+        .await
+        .with_context(|| format!("load_table({from_str})"))?;
+
+    // Load destination
+    let dst_ident = parse_table(to_str)?;
+    let dst_table = catalog
+        .load_table(&dst_ident)
+        .await
+        .with_context(|| format!("load_table({to_str})"))?;
+
+    let dst_meta = dst_table.metadata();
+    let dst_schema = dst_meta.current_schema();
+    let dst_partition_spec = dst_meta.default_partition_spec();
+
+    // Scan source
+    let stream = src_table
+        .scan()
+        .build()
+        .context("build scan")?
+        .to_arrow()
+        .await
+        .context("to_arrow")?;
+
+    let all_batches: Vec<RecordBatch> = stream.try_collect().await.context("collect")?;
+
+    // Apply row limit if requested
+    let batches: Vec<RecordBatch> = if let Some(max_rows) = limit {
+        let mut out = Vec::new();
+        let mut remaining = max_rows;
+        for batch in all_batches {
+            if remaining == 0 {
+                break;
+            }
+            if batch.num_rows() <= remaining {
+                remaining -= batch.num_rows();
+                out.push(batch);
+            } else {
+                out.push(batch.slice(0, remaining));
+                remaining = 0;
+            }
+        }
+        out
+    } else {
+        all_batches
+    };
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+    if total_rows == 0 {
+        println!("Source table '{from_str}' is empty — nothing to copy.");
+        return Ok(());
+    }
+
+    // Write to destination using fast-append
+    let location_gen = DefaultLocationGenerator::new(dst_meta.clone())?;
+    let file_name_gen =
+        ProductionFileNameGenerator::new("data", None::<&str>, DataFileFormat::Parquet);
+    let parquet_builder =
+        ParquetWriterBuilder::new(WriterProperties::builder().build(), dst_schema.clone());
+    let rolling_builder =
+        iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder::new(
+            parquet_builder,
+            536_870_912usize,
+            dst_table.file_io().clone(),
+            location_gen,
+            file_name_gen,
+        );
+
+    let partition_key = if dst_partition_spec.is_unpartitioned() {
+        None
+    } else {
+        // For a simple copy we skip partition override; the writer will use the default.
+        None
+    };
+
+    let mut writer = DataFileWriterBuilder::new(rolling_builder)
+        .build(partition_key)
+        .await?;
+
+    for batch in batches {
+        writer.write(batch).await?;
+    }
+    let data_files = writer.close().await?;
+
+    let tx = iceberg::transaction::Transaction::new(&dst_table);
+    let action = tx.fast_append().add_data_files(data_files);
+    let tx = action.apply(tx)?;
+    let updated = tx.commit(catalog).await?;
+
+    println!(
+        "Copied {total_rows} rows from '{from_str}' → '{to_str}'. New snapshot: {:?}",
+        updated
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id())
+    );
     Ok(())
 }
 
