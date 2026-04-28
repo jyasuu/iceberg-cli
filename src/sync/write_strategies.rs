@@ -59,6 +59,7 @@ use arrow_array::Array;
 use arrow_array::{RecordBatch, StringArray};
 use arrow_schema::DataType;
 use chrono;
+use chrono::Datelike;
 use futures::TryStreamExt;
 use iceberg::{
     expr::{Predicate, Reference},
@@ -74,10 +75,7 @@ use iceberg::{
             data_file_writer::DataFileWriterBuilder,
             equality_delete_writer::{EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig},
         },
-        file_writer::{
-            ParquetWriterBuilder, location_generator::DefaultLocationGenerator,
-            rolling_writer::RollingFileWriterBuilder,
-        },
+        file_writer::{ParquetWriterBuilder, rolling_writer::RollingFileWriterBuilder},
     },
 };
 use parquet::file::properties::WriterProperties;
@@ -935,8 +933,20 @@ pub(crate) async fn write_parquet(
             .context("build projected Iceberg schema for write_parquet")?,
     );
 
-    let loc_gen = DefaultLocationGenerator::new(meta.clone())
-        .context("Failed to create location generator")?;
+    // Build the partition key first so we have the raw partition value (µs)
+    // available for SafeLocationGenerator before constructing the writer stack.
+    //
+    // iceberg-rust 0.9 bug: DefaultLocationGenerator calls
+    // PartitionSpec::partition_to_path → Datum::to_human_string, which hits
+    // unreachable!() for Timestamp/Timestamptz variants.  SafeLocationGenerator
+    // computes the partition directory from raw µs without touching that path.
+    let partition_key = build_partition_key_for_batch(table, &batch, &schema)
+        .context("write_parquet: failed to build partition key")?;
+
+    let partition_us = extract_partition_timestamp_us(table, &batch);
+
+    let loc_gen = crate::sync::file_name::SafeLocationGenerator::new(meta, partition_us)
+        .context("Failed to create SafeLocationGenerator")?;
 
     let name_gen =
         ProductionFileNameGenerator::new("data", Some(job.name.as_str()), DataFileFormat::Parquet);
@@ -951,14 +961,6 @@ pub(crate) async fn write_parquet(
         loc_gen,
         name_gen,
     );
-
-    // Build a PartitionKey when the table has a real partition spec so that
-    // the DataFileWriter can stamp the correct partition metadata onto every
-    // DataFile it produces.  Passing `None` when a spec exists causes:
-    //   DataInvalid => Partition value is not compatible with partition type
-    // because the writer validates that the partition struct matches the spec.
-    let partition_key = build_partition_key_for_batch(table, &batch, &schema)
-        .context("write_parquet: failed to build partition key")?;
 
     let mut writer = DataFileWriterBuilder::new(rolling)
         .build(partition_key)
@@ -1028,7 +1030,73 @@ fn build_partition_key_for_batch(
         let col = batch.column(col_idx);
 
         // Extract the first row's value and convert to an Iceberg Literal.
+        //
+        // IMPORTANT: `PartitionKey.data` must contain the **post-transform
+        // result** literal, not the raw source literal.  `transaction.rs` in
+        // iceberg-rust 0.9 validates each partition value against the result
+        // type of the transform (e.g. `Day(Timestamp)` -> `Date`, stored as
+        // `Literal::date(days)`).  Passing `Literal::timestamp(us)` instead
+        // fails with "DataInvalid => Partition value is not compatible partition
+        // type".
+        //
+        // Temporal transforms applied here:
+        //   Hour   -> Literal::int(hours_since_epoch)
+        //   Day    -> Literal::date(days_since_epoch)
+        //   Month  -> Literal::int(months_since_epoch)
+        //   Year   -> Literal::int(years_since_epoch)
+        //
+        // For identity / non-temporal transforms the raw source literal is
+        // correct because the result type equals the source type.
         let lit = match source_field.field_type.as_primitive_type() {
+            Some(PrimitiveType::Timestamp) | Some(PrimitiveType::Timestamptz) => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .with_context(|| {
+                        format!(
+                            "build_partition_key: column '{col_name}' is not TimestampMicrosecond"
+                        )
+                    })?;
+                let us: i64 = arr.value(0);
+                // Apply the transform to produce the result literal.
+                match field.transform {
+                    Transform::Hour => {
+                        let hours = (us / 3_600_000_000) as i32;
+                        Literal::int(hours)
+                    }
+                    Transform::Day => {
+                        let days = (us / 86_400_000_000) as i32;
+                        Literal::date(days)
+                    }
+                    Transform::Month => {
+                        let days = us / 86_400_000_000;
+                        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                        let d = epoch
+                            + chrono::Duration::try_days(days).unwrap_or(chrono::Duration::zero());
+                        let months = (d.year() as i32 - 1970) * 12 + (d.month() as i32 - 1);
+                        Literal::int(months)
+                    }
+                    Transform::Year => {
+                        let days = us / 86_400_000_000;
+                        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                        let d = epoch
+                            + chrono::Duration::try_days(days).unwrap_or(chrono::Duration::zero());
+                        let years = d.year() as i32 - 1970;
+                        Literal::int(years)
+                    }
+                    // Identity or other non-temporal transforms: raw source literal.
+                    _ => {
+                        if matches!(
+                            source_field.field_type.as_primitive_type(),
+                            Some(PrimitiveType::Timestamptz)
+                        ) {
+                            Literal::timestamptz(us)
+                        } else {
+                            Literal::timestamp(us)
+                        }
+                    }
+                }
+            }
             Some(PrimitiveType::Date) => {
                 // Arrow Date32 = days since Unix epoch; Iceberg date literal = same.
                 let arr = col
@@ -1059,17 +1127,6 @@ fn build_partition_key_for_batch(
                     format!("build_partition_key: column '{col_name}' is not Int32")
                 })?;
                 Literal::int(arr.value(0))
-            }
-            Some(PrimitiveType::Timestamp) | Some(PrimitiveType::Timestamptz) => {
-                let arr = col
-                    .as_any()
-                    .downcast_ref::<TimestampMicrosecondArray>()
-                    .with_context(|| {
-                        format!(
-                            "build_partition_key: column '{col_name}' is not TimestampMicrosecond"
-                        )
-                    })?;
-                Literal::timestamp(arr.value(0))
             }
             other => anyhow::bail!(
                 "build_partition_key: unsupported partition source type {:?} for column '{col_name}'",
@@ -1162,7 +1219,10 @@ async fn _emit_equality_deletes(
         )
     };
 
-    let loc_gen = DefaultLocationGenerator::new(meta.clone())
+    // Equality-delete files are always unpartitioned in our COW model;
+    // SafeLocationGenerator with partition_us=0 falls through to DefaultLocationGenerator
+    // for unpartitioned specs, so this is safe even if the data table is partitioned.
+    let loc_gen = crate::sync::file_name::SafeLocationGenerator::new(meta, 0)
         .context("Failed to create location generator for delete files")?;
 
     let name_gen = ProductionFileNameGenerator::new(
@@ -1711,6 +1771,57 @@ fn extract_string_column_values(
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
+
+/// Extract the raw microsecond timestamp of the first row's partition column.
+///
+/// Returns `0` for unpartitioned tables or when the partition source column
+/// is not a timestamp type.  Used by [`SafeLocationGenerator`] to compute the
+/// partition directory path without calling `Datum::to_human_string`.
+fn extract_partition_timestamp_us(table: &iceberg::table::Table, batch: &RecordBatch) -> i64 {
+    use arrow_array::TimestampMicrosecondArray;
+    use iceberg::spec::PrimitiveType;
+
+    let meta = table.metadata();
+    let spec = meta.default_partition_spec();
+    if spec.is_unpartitioned() || batch.num_rows() == 0 {
+        return 0;
+    }
+
+    let full_schema = meta.current_schema();
+    for field in spec.fields() {
+        let is_temporal = matches!(
+            field.transform,
+            Transform::Hour | Transform::Day | Transform::Month | Transform::Year
+        );
+        if !is_temporal {
+            continue;
+        }
+
+        let source_field = match full_schema.field_by_id(field.source_id) {
+            Some(f) => f,
+            None => continue,
+        };
+        let is_ts = matches!(
+            source_field.field_type.as_primitive_type(),
+            Some(PrimitiveType::Timestamp) | Some(PrimitiveType::Timestamptz)
+        );
+        if !is_ts {
+            continue;
+        }
+
+        // Found the first temporal timestamp partition field.
+        let col_name = &source_field.name;
+        if let Ok(idx) = batch.schema().index_of(col_name) {
+            let col = batch.column(idx);
+            if let Some(arr) = col.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                if !arr.is_null(0) {
+                    return arr.value(0);
+                }
+            }
+        }
+    }
+    0
+}
 
 #[cfg(test)]
 mod tests {

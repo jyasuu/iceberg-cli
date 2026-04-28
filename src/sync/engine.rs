@@ -58,17 +58,19 @@ use tracing::{info, warn};
 
 use crate::config::{
     // IcebergPartitionConfig,
+    CursorType,
     RetryConfig,
     SchemaEvolutionConfig,
     SyncJob,
     SyncMode,
+    WatermarkType,
     WriteMode,
 };
 use crate::sync::{
     // file_name::ProductionFileNameGenerator,
     metadata::{RunSummary, build_metadata_updates, read_watermark},
     postgres::{
-        SqlValue, connect as pg_connect, max_int_in_batch, max_timestamp_in_batch, query_to_batch,
+        SqlValue, connect as pg_connect, max_int_in_batch, max_text_in_batch, max_timestamp_in_batch, query_to_batch,
     },
     write_strategies::{
         apply_plan_to_transaction, plan_append, plan_merge_into, plan_overwrite, plan_upsert,
@@ -175,25 +177,49 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
 
         // ── 2. Build SQL parameters ───────────────────────────────────────────
         let mut params: HashMap<String, SqlValue> = extra_params.unwrap_or_default();
-        if let Some(wm) = watermark {
-            params.insert("watermark".to_string(), SqlValue::Timestamp(wm));
-        } else {
-            params.insert(
-                "watermark".to_string(),
-                SqlValue::Timestamp(DateTime::UNIX_EPOCH),
-            );
-        }
+
+        // Bind :watermark with the correct Postgres type.
+        // TIMESTAMPTZ columns require DateTime<Utc>; plain TIMESTAMP columns
+        // require NaiveDateTime.  Sending the wrong type produces:
+        //   "cannot convert between the Rust type chrono::datetime::DateTime<Utc>
+        //    and the Postgres type 'timestamp'"
+        let wm_value = watermark.unwrap_or(DateTime::UNIX_EPOCH);
+        let wm_sql_val = match job.watermark_type {
+            WatermarkType::Timestamptz => {
+                tracing::debug!(watermark = ?wm_value, "Binding :watermark as TIMESTAMPTZ");
+                SqlValue::Timestamp(wm_value)
+            }
+            WatermarkType::Timestamp => {
+                let naive = wm_value.naive_utc();
+                tracing::debug!(watermark = ?naive, "Binding :watermark as TIMESTAMP (no tz)");
+                SqlValue::TimestampNoTz(naive)
+            }
+        };
+        params.insert("watermark".to_string(), wm_sql_val);
 
         // ── 3. Fetch & write in batches ───────────────────────────────────────
         let mut total_rows: usize = 0;
         let mut new_watermark: Option<DateTime<Utc>> = watermark;
 
         let mut cursor_value: i64 = i64::MIN;
+        let mut cursor_text_value: String = String::new();
         let mut offset: usize = 0;
 
         loop {
             if job.cursor_column.is_some() {
-                params.insert("_cursor".to_string(), SqlValue::Int(cursor_value));
+                // Bind :_cursor with the correct Postgres type.
+                // Use cursor_type: text for TEXT/VARCHAR cursor columns to avoid:
+                //   "cannot convert between the Rust type i64 and the Postgres type 'text'"
+                match job.cursor_type {
+                    CursorType::Int => {
+                        tracing::debug!(cursor = cursor_value, "Binding :_cursor as Int(i64)");
+                        params.insert("_cursor".to_string(), SqlValue::Int(cursor_value));
+                    }
+                    CursorType::Text => {
+                        tracing::debug!(cursor = %cursor_text_value, "Binding :_cursor as Text");
+                        params.insert("_cursor".to_string(), SqlValue::Text(cursor_text_value.clone()));
+                    }
+                }
             }
 
             let paged_sql = build_paged_sql(job, offset);
@@ -223,8 +249,17 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
                         // injected by build_paged_sql. This sentinel is always
                         // present regardless of whether the user SQL SELECTs
                         // the cursor column explicitly.
-                        if let Some(max_id) = max_int_in_batch(&rb, "_pgcursor") {
-                            cursor_value = max_id;
+                        match job.cursor_type {
+                            CursorType::Int => {
+                                if let Some(max_id) = max_int_in_batch(&rb, "_pgcursor") {
+                                    cursor_value = max_id;
+                                }
+                            }
+                            CursorType::Text => {
+                                if let Some(max_str) = max_text_in_batch(&rb, "_pgcursor") {
+                                    cursor_text_value = max_str;
+                                }
+                            }
                         }
                         // Strip the _pgcursor sentinel before writing to Iceberg;
                         // it is not part of the destination schema.
@@ -680,7 +715,9 @@ mod tests {
             group: None,
             sql: "SELECT id, val FROM events WHERE ts > :watermark ORDER BY ts".into(),
             watermark_column: Some("ts".into()),
+            watermark_type: crate::config::WatermarkType::Timestamptz,
             cursor_column: None,
+            cursor_type: crate::config::CursorType::Int,
             depends_on: None,
             batch_size: 100,
             mode: SyncMode::Incremental,

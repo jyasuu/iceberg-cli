@@ -57,7 +57,7 @@ mod tests {
 
     /// Minimal `SyncJob` stub for pagination tests.
     fn base_job() -> SyncJob {
-        use crate::config::{SyncMode, WriteMode};
+        use crate::config::{CursorType, SyncMode, WatermarkType, WriteMode};
         SyncJob {
             name: "test_job".into(),
             source: "src".into(),
@@ -69,7 +69,9 @@ mod tests {
             batch_size: 100,
             write_mode: WriteMode::Append,
             watermark_column: None,
+            watermark_type: WatermarkType::Timestamptz,
             cursor_column: None,
+            cursor_type: CursorType::Int,
             partition_column: None,
             iceberg_partition: None,
             merge: None,
