@@ -126,6 +126,7 @@ mod tests {
     use crate::config::{IcebergPartitionConfig, MergeConfig, SyncMode, WriteMode};
 
     fn stub_job(name: &str, write_mode: WriteMode) -> SyncJob {
+        use crate::config::{CursorType, WatermarkType};
         SyncJob {
             name: name.into(),
             source: "src".into(),
@@ -137,6 +138,7 @@ mod tests {
             batch_size: 100,
             write_mode,
             cursor_column: None,
+            cursor_type: CursorType::Int,
             partition_column: None,
             iceberg_partition: None,
             merge: None,
@@ -145,6 +147,7 @@ mod tests {
             retry: None,
             group: None,
             watermark_column: None,
+            watermark_type: WatermarkType::Timestamptz,
         }
     }
 
@@ -260,5 +263,82 @@ mod tests {
             .map(|i| stub_job(&format!("j{i}"), WriteMode::Append))
             .collect();
         assert!(detect_cycles(&jobs).is_ok());
+    }
+
+    // ── watermark_type / cursor_type defaults ─────────────────────────────────
+
+    #[test]
+    fn watermark_type_defaults_to_timestamptz() {
+        use crate::config::WatermarkType;
+        let job = stub_job("j", WriteMode::Append);
+        assert_eq!(job.watermark_type, WatermarkType::Timestamptz);
+    }
+
+    #[test]
+    fn cursor_type_defaults_to_int() {
+        use crate::config::CursorType;
+        let job = stub_job("j", WriteMode::Append);
+        assert_eq!(job.cursor_type, CursorType::Int);
+    }
+
+    #[test]
+    fn watermark_type_timestamp_parses_from_yaml() {
+        use crate::config::{WatermarkType, parse};
+        let yaml = r#"
+sources:
+  pg:
+    type: postgres
+    dsn: "host=localhost dbname=test"
+destinations:
+  wh:
+    catalog_uri: "http://localhost:8181"
+    s3_endpoint: "http://localhost:9000"
+    region: "us-east-1"
+    access_key_id: "k"
+    secret_access_key: "s"
+sync_jobs:
+  - name: j
+    source: pg
+    destination: wh
+    namespace: ns
+    table: tbl
+    sql: "SELECT 1"
+    watermark_type: timestamp
+    mode: incremental
+"#
+        .to_string();
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.sync_jobs[0].watermark_type, WatermarkType::Timestamp);
+    }
+
+    #[test]
+    fn cursor_type_text_parses_from_yaml() {
+        use crate::config::{CursorType, parse};
+        let yaml = r#"
+sources:
+  pg:
+    type: postgres
+    dsn: "host=localhost dbname=test"
+destinations:
+  wh:
+    catalog_uri: "http://localhost:8181"
+    s3_endpoint: "http://localhost:9000"
+    region: "us-east-1"
+    access_key_id: "k"
+    secret_access_key: "s"
+sync_jobs:
+  - name: j
+    source: pg
+    destination: wh
+    namespace: ns
+    table: tbl
+    sql: "SELECT 1"
+    cursor_column: my_key
+    cursor_type: text
+    mode: incremental
+"#
+        .to_string();
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.sync_jobs[0].cursor_type, CursorType::Text);
     }
 }

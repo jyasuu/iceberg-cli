@@ -3153,3 +3153,738 @@ sync_jobs:
         pg_exec(&format!("DROP TABLE IF EXISTS {pg_tbl}"));
     }
 }
+
+// =============================================================================
+// § 15 – Bug-fix regression tests
+//
+// Each sub-test targets one of the three reported production errors:
+//
+//   15.1  watermark_type: timestamp  — plain TIMESTAMP (no tz) watermark column
+//         Previously failed with:
+//           error serializing parameter 0: cannot convert between the Rust type
+//           `chrono::datetime::DateTime<chrono::offset::utc::Utc>` and the
+//           Postgres type `timestamp`
+//
+//   15.2  cursor_type: text  — TEXT/VARCHAR cursor column (UUID v7 style)
+//         Previously failed with:
+//           error serializing parameter 0: cannot convert between the Rust type
+//           `i64` and the Postgres type `text`
+//
+//   15.3  timestamp partition column — TIMESTAMPTZ column used as iceberg_partition
+//         Previously panicked with:
+//           internal error: entered unreachable code
+//           (iceberg-rust 0.9 Datum::to_human_string for Timestamp/Timestamptz)
+//         Fixed by SafeLocationGenerator in sync/file_name.rs.
+//
+// All three tests require a live docker-compose stack (same as § 11–14).
+// Run only this section:
+//   cargo test --test integration_test bugfix -- --test-threads=1
+// =============================================================================
+#[cfg(test)]
+mod bugfix {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static BF_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_id(prefix: &str) -> String {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let seq = BF_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}_{ms}_{seq}")
+    }
+
+    fn pg_reachable() -> bool {
+        std::net::TcpStream::connect("localhost:5432").is_ok()
+    }
+
+    fn pg_exec(sql: &str) {
+        let dsn = pg_dsn();
+        let mut host = "localhost";
+        let mut port = "5432";
+        let mut dbname = "shop";
+        let mut user = "app";
+        let mut password = "secret";
+        for pair in dsn.split_whitespace() {
+            if let Some((k, v)) = pair.split_once('=') {
+                match k {
+                    "host" => host = v,
+                    "port" => port = v,
+                    "dbname" => dbname = v,
+                    "user" => user = v,
+                    "password" => password = v,
+                    _ => {}
+                }
+            }
+        }
+        let out = std::process::Command::new("psql")
+            .env("PGPASSWORD", password)
+            .args(["-h", host, "-p", port, "-U", user, "-d", dbname, "-c", sql])
+            .output()
+            .expect("psql not found");
+        assert!(
+            out.status.success(),
+            "pg_exec failed:\nSQL: {sql}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn scan_row_count(full_table: &str) -> usize {
+        let out = assert_ok(
+            &format!("scan {full_table}"),
+            &["scan", "--table", full_table, "--limit", "99999"],
+        );
+        out.lines()
+            .rev()
+            .find_map(|line| {
+                let t = line.trim().trim_start_matches('(');
+                t.split_once(" rows shown")
+                    .and_then(|(n, _)| n.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    fn sync_cfg_yaml(
+        _pg_tbl: &str,
+        ns: &str,
+        iceberg_tbl: &str,
+        sql: &str,
+        extra_job_yaml: &str,
+    ) -> String {
+        format!(
+            r#"
+sources:
+  bf_pg:
+    type: postgres
+    dsn: "{pg}"
+destinations:
+  warehouse:
+    catalog_uri: "{iceberg}"
+    s3_endpoint:  "{s3}"
+    region:       "{region}"
+    access_key_id: "{ak}"
+    secret_access_key: "{sk}"
+sync_jobs:
+  - name: bf_job
+    source: bf_pg
+    destination: warehouse
+    namespace: {ns}
+    table: {tbl}
+    sql: |
+      {sql}
+    {extra}
+"#,
+            pg = pg_dsn(),
+            iceberg = iceberg_uri(),
+            s3 = s3_endpoint(),
+            region = region(),
+            ak = access_key(),
+            sk = secret_key(),
+            ns = ns,
+            tbl = iceberg_tbl,
+            sql = sql,
+            extra = extra_job_yaml,
+        )
+    }
+
+    // =========================================================================
+    // § 15.1 — watermark_type: timestamp (plain TIMESTAMP, no tz)
+    //
+    // Creates a Postgres table with a TIMESTAMP (no timezone) watermark column.
+    // With the old code, the engine would send DateTime<Utc> as the :watermark
+    // parameter against a TIMESTAMP column, causing tokio-postgres to error:
+    //   "cannot convert between ... DateTime<Utc> and the Postgres type `timestamp`"
+    //
+    // The fix: config field `watermark_type: timestamp` causes the engine to
+    // wrap the watermark as SqlValue::TimestampNoTz(NaiveDateTime) instead,
+    // which tokio-postgres maps correctly to the TIMESTAMP type.
+    //
+    // This test:
+    //   1. Creates a TIMESTAMP (no tz) column as the watermark.
+    //   2. Inserts two batches at different timestamps.
+    //   3. Syncs twice, asserting the row count grows incrementally.
+    //   4. Re-syncs with no new data (idempotency check).
+    // =========================================================================
+    #[test]
+    fn t15_1_watermark_type_timestamp_no_tz() {
+        if !pg_reachable() {
+            eprintln!("SKIP t15_1: postgres not reachable");
+            return;
+        }
+        preflight();
+
+        let id = test_id("bf15_1");
+        let pg_tbl = format!("bf_ts_ntz_{id}");
+        let ns = format!("bf_{id}");
+        let iceberg_tbl = "bf_events_ntz";
+        let full = format!("{ns}.{iceberg_tbl}");
+
+        cli(&["create-namespace", "--namespace", &ns]);
+
+        // Create a table with a plain TIMESTAMP (no tz) watermark column.
+        pg_exec(&format!(
+            "CREATE TABLE {pg_tbl} ( \
+               id       BIGSERIAL    PRIMARY KEY, \
+               label    TEXT         NOT NULL, \
+               value    BIGINT       NOT NULL, \
+               evt_at   TIMESTAMP    NOT NULL \
+             )"
+        ));
+        pg_exec(&format!("CREATE INDEX ON {pg_tbl}(evt_at)"));
+
+        // Use absolute past timestamps to avoid clock-skew issues.
+        // Stage 1: 3 rows
+        for i in 1i64..=3 {
+            pg_exec(&format!(
+                "INSERT INTO {pg_tbl} (label, value, evt_at) VALUES \
+                 ('stage1_row{i}', {i}, \
+                  TIMESTAMP '2021-06-01 00:00:00' + INTERVAL '{i} seconds')"
+            ));
+        }
+
+        let sql = format!(
+            "SELECT id, label, value, evt_at \
+             FROM {pg_tbl} \
+             WHERE evt_at > :watermark \
+             ORDER BY evt_at ASC, id ASC"
+        );
+        // Key: watermark_type: timestamp  (plain TIMESTAMP, no tz)
+        let extra = "watermark_column: evt_at\n    watermark_type: timestamp\n    cursor_column: id\n    batch_size: 10\n    mode: incremental\n    write_mode: append";
+
+        with_sync_config(
+            &sync_cfg_yaml(&pg_tbl, &ns, iceberg_tbl, &sql, extra),
+            |cfg| {
+                // First sync: should pick up 3 rows without the DateTime<Utc>/TIMESTAMP error.
+                assert_ok(
+                    "15.1 first sync (no-tz watermark)",
+                    &["sync", "--config", cfg, "--job", "bf_job"],
+                );
+                assert_eq!(scan_row_count(&full), 3, "15.1 first sync: expected 3 rows");
+
+                // Stage 2: 4 more rows with later timestamps.
+                for i in 1i64..=4 {
+                    pg_exec(&format!(
+                        "INSERT INTO {pg_tbl} (label, value, evt_at) VALUES \
+                     ('stage2_row{i}', {i}00, \
+                      TIMESTAMP '2021-07-01 00:00:00' + INTERVAL '{i} seconds')"
+                    ));
+                }
+                assert_ok(
+                    "15.1 second sync (incremental)",
+                    &["sync", "--config", cfg, "--job", "bf_job"],
+                );
+                assert_eq!(
+                    scan_row_count(&full),
+                    7,
+                    "15.1 second sync: expected 7 total rows"
+                );
+
+                // Idempotency: re-run with no new data should not add rows.
+                assert_ok(
+                    "15.1 noop sync",
+                    &["sync", "--config", cfg, "--job", "bf_job"],
+                );
+                assert_eq!(
+                    scan_row_count(&full),
+                    7,
+                    "15.1 noop sync: expected still 7 rows"
+                );
+            },
+        );
+
+        pg_exec(&format!("DROP TABLE IF EXISTS {pg_tbl}"));
+    }
+
+    // =========================================================================
+    // § 15.2 — cursor_type: text (TEXT/VARCHAR cursor column, e.g. UUID v7)
+    //
+    // Creates a Postgres table with a TEXT primary key used as the cursor.
+    // With the old code, the engine would try to bind the cursor sentinel as
+    // i64, causing tokio-postgres to error:
+    //   "cannot convert between ... i64 and the Postgres type `text`"
+    //
+    // The fix: config field `cursor_type: text` causes the engine to send
+    // SqlValue::Text(String) instead of SqlValue::Int(i64), matching the TEXT
+    // column type.
+    //
+    // UUID v7 keys sort lexicographically by creation time, so the cursor
+    // approach still pages correctly.
+    //
+    // This test:
+    //   1. Creates a table with a TEXT PK (simulating UUID v7 style IDs).
+    //   2. Inserts rows with fixed prefixed text IDs (lexicographic ordering).
+    //   3. Syncs with batch_size=3 to force multi-page cursor pagination.
+    //   4. Asserts all rows land without the i64/text type error.
+    //   5. Verifies incremental re-sync picks up only new rows.
+    // =========================================================================
+    #[test]
+    fn t15_2_cursor_type_text_uuid_v7_style() {
+        if !pg_reachable() {
+            eprintln!("SKIP t15_2: postgres not reachable");
+            return;
+        }
+        preflight();
+
+        let id = test_id("bf15_2");
+        let pg_tbl = format!("bf_txt_cursor_{id}");
+        let ns = format!("bf_{id}");
+        let iceberg_tbl = "bf_txt_events";
+        let full = format!("{ns}.{iceberg_tbl}");
+
+        cli(&["create-namespace", "--namespace", &ns]);
+
+        // TEXT primary key — lexicographically sortable (simulates UUID v7).
+        // We use zero-padded integer strings so the lex sort equals numeric sort.
+        pg_exec(&format!(
+            "CREATE TABLE {pg_tbl} ( \
+               uid      TEXT         PRIMARY KEY, \
+               label    TEXT         NOT NULL, \
+               value    BIGINT       NOT NULL, \
+               evt_at   TIMESTAMPTZ  NOT NULL DEFAULT now() \
+             )"
+        ));
+        pg_exec(&format!("CREATE INDEX ON {pg_tbl}(uid)"));
+
+        // Insert 8 rows with sortable text keys "UID-00001" … "UID-00008".
+        for i in 1i64..=8 {
+            pg_exec(&format!(
+                "INSERT INTO {pg_tbl} (uid, label, value, evt_at) VALUES \
+                 ('UID-{i:05}', 'label_{i}', {i}, \
+                  TIMESTAMP '2022-03-01' + INTERVAL '{i} seconds')"
+            ));
+        }
+
+        let sql = format!(
+            "SELECT uid, label, value, evt_at \
+             FROM {pg_tbl} \
+             WHERE evt_at > :watermark \
+             ORDER BY evt_at ASC, uid ASC"
+        );
+        // Key: cursor_type: text  (TEXT/VARCHAR cursor column)
+        let extra = "watermark_column: evt_at\n    watermark_type: timestamptz\n    cursor_column: uid\n    cursor_type: text\n    batch_size: 3\n    mode: incremental\n    write_mode: append";
+
+        with_sync_config(
+            &sync_cfg_yaml(&pg_tbl, &ns, iceberg_tbl, &sql, extra),
+            |cfg| {
+                // First sync: 3 pages (3+3+2) — must not error with i64/text mismatch.
+                assert_ok(
+                    "15.2 first sync (text cursor)",
+                    &["sync", "--config", cfg, "--job", "bf_job"],
+                );
+                assert_eq!(
+                    scan_row_count(&full),
+                    8,
+                    "15.2 first sync: expected all 8 rows"
+                );
+
+                // Insert 3 more rows at later timestamps.
+                for i in 9i64..=11 {
+                    pg_exec(&format!(
+                        "INSERT INTO {pg_tbl} (uid, label, value, evt_at) VALUES \
+                     ('UID-{i:05}', 'label_{i}', {i}, \
+                      TIMESTAMP '2022-04-01' + INTERVAL '{i} seconds')"
+                    ));
+                }
+
+                // Incremental re-sync: should pick up only the 3 new rows.
+                assert_ok(
+                    "15.2 incremental sync (text cursor)",
+                    &["sync", "--config", cfg, "--job", "bf_job"],
+                );
+                assert_eq!(
+                    scan_row_count(&full),
+                    11,
+                    "15.2 incremental sync: expected 11 total rows (8+3)"
+                );
+
+                // Noop re-sync.
+                assert_ok(
+                    "15.2 noop sync",
+                    &["sync", "--config", cfg, "--job", "bf_job"],
+                );
+                assert_eq!(
+                    scan_row_count(&full),
+                    11,
+                    "15.2 noop sync: expected still 11 rows"
+                );
+            },
+        );
+
+        pg_exec(&format!("DROP TABLE IF EXISTS {pg_tbl}"));
+    }
+
+    // =========================================================================
+    // § 15.3 — TIMESTAMPTZ partition column with iceberg_partition
+    //
+    // Previously panicked with:
+    //   internal error: entered unreachable code
+    //   (iceberg-rust 0.9 Datum::to_human_string for Timestamp/Timestamptz)
+    //
+    // The fix: SafeLocationGenerator in sync/file_name.rs computes the Hive-
+    // style partition directory from raw µs values, bypassing the broken
+    // DefaultLocationGenerator path.
+    //
+    // This test covers:
+    //   (a) TIMESTAMPTZ column as iceberg_partition source — day transform
+    //   (b) Multiple days of data → correct partition isolation
+    //   (c) Overwrite replaces only the matching day partition
+    //   (d) Hour transform on TIMESTAMPTZ column (coarser granularity test)
+    //
+    // Sub-test 15.3a: day transform, TIMESTAMPTZ column, overwrite isolation
+    // Sub-test 15.3b: hour transform on TIMESTAMPTZ column
+    // =========================================================================
+
+    // ── 15.3a: day transform ──────────────────────────────────────────────────
+    #[test]
+    fn t15_3a_timestamptz_partition_day_transform() {
+        if !pg_reachable() {
+            eprintln!("SKIP t15_3a: postgres not reachable");
+            return;
+        }
+        preflight();
+
+        let id = test_id("bf15_3a");
+        let pg_tbl = format!("bf_tstz_day_{id}");
+        let ns = format!("bf_{id}");
+        let iceberg_tbl = "bf_tstz_day";
+        let full = format!("{ns}.{iceberg_tbl}");
+
+        cli(&["create-namespace", "--namespace", &ns]);
+
+        // Table with a TIMESTAMPTZ column — this is the type that previously panicked.
+        pg_exec(&format!(
+            "CREATE TABLE {pg_tbl} ( \
+               id       BIGSERIAL   PRIMARY KEY, \
+               label    TEXT        NOT NULL, \
+               value    BIGINT      NOT NULL, \
+               event_ts TIMESTAMPTZ NOT NULL \
+             )"
+        ));
+        pg_exec(&format!("CREATE INDEX ON {pg_tbl}(event_ts)"));
+
+        // Insert rows spanning two different UTC days.
+        // Day A: 2024-05-10 — 3 rows
+        for i in 1i64..=3 {
+            pg_exec(&format!(
+                "INSERT INTO {pg_tbl} (label, value, event_ts) VALUES \
+                 ('day_a_row{i}', {i}00, \
+                  TIMESTAMPTZ '2024-05-10 10:00:00+00' + INTERVAL '{i} hours')"
+            ));
+        }
+        // Day B: 2024-05-11 — 2 rows
+        for i in 1i64..=2 {
+            pg_exec(&format!(
+                "INSERT INTO {pg_tbl} (label, value, event_ts) VALUES \
+                 ('day_b_row{i}', {i}000, \
+                  TIMESTAMPTZ '2024-05-11 08:00:00+00' + INTERVAL '{i} hours')"
+            ));
+        }
+
+        // Sync Day A only (WHERE clause).
+        let sql_day_a = format!(
+            "SELECT id, label, value, event_ts \
+             FROM {pg_tbl} \
+             WHERE event_ts::date = '2024-05-10' \
+             ORDER BY event_ts ASC, id ASC"
+        );
+        // iceberg_partition on a TIMESTAMPTZ column — previously caused the panic.
+        let extra = "watermark_column: ~\n    batch_size: 100\n    mode: full\n    write_mode: overwrite\n    iceberg_partition:\n      column: event_ts\n      transform: day";
+
+        with_sync_config(
+            &sync_cfg_yaml(&pg_tbl, &ns, iceberg_tbl, &sql_day_a, extra),
+            |cfg_a| {
+                // Run 1: sync Day A — must not panic on TIMESTAMPTZ partition path.
+                assert_ok(
+                    "15.3a run1: Day A sync (TIMESTAMPTZ partition)",
+                    &["sync", "--config", cfg_a, "--job", "bf_job"],
+                );
+                assert_eq!(
+                    scan_row_count(&full),
+                    3,
+                    "15.3a run1: expected 3 rows after Day A sync"
+                );
+
+                // Sync Day B into the same partitioned table.
+                let sql_day_b = format!(
+                    "SELECT id, label, value, event_ts \
+                     FROM {pg_tbl} \
+                     WHERE event_ts::date = '2024-05-11' \
+                     ORDER BY event_ts ASC, id ASC"
+                );
+                with_sync_config(
+                    &sync_cfg_yaml(&pg_tbl, &ns, iceberg_tbl, &sql_day_b, extra),
+                    |cfg_b| {
+                        assert_ok(
+                            "15.3a run1b: Day B sync",
+                            &["sync", "--config", cfg_b, "--job", "bf_job"],
+                        );
+                        // Both days loaded: 3 + 2 = 5
+                        assert_eq!(
+                            scan_row_count(&full),
+                            5,
+                            "15.3a after both days: expected 5 rows"
+                        );
+
+                        // Overwrite Day A with fresh data (1 row) — Day B must be untouched.
+                        pg_exec(&format!(
+                            "DELETE FROM {pg_tbl} WHERE event_ts::date = '2024-05-10'"
+                        ));
+                        pg_exec(&format!(
+                            "INSERT INTO {pg_tbl} (label, value, event_ts) VALUES \
+                             ('day_a_new', 9999, TIMESTAMPTZ '2024-05-10 12:00:00+00')"
+                        ));
+
+                        assert_ok(
+                            "15.3a run2: overwrite Day A",
+                            &["sync", "--config", cfg_a, "--job", "bf_job"],
+                        );
+                        // Day A replaced (1 new row) + Day B (2) = 3
+                        assert_eq!(
+                            scan_row_count(&full),
+                            3,
+                            "15.3a run2: Day A replaced (1) + Day B untouched (2) = 3"
+                        );
+
+                        // Day B rows must still be visible.
+                        assert_output(
+                            "15.3a run2: Day B row still present",
+                            "day_b_row1",
+                            &["scan", "--table", &full, "--limit", "99999"],
+                        );
+
+                        // New Day A row must be present.
+                        assert_output(
+                            "15.3a run2: new Day A row present",
+                            "day_a_new",
+                            &["scan", "--table", &full, "--limit", "99999"],
+                        );
+                    },
+                );
+            },
+        );
+
+        pg_exec(&format!("DROP TABLE IF EXISTS {pg_tbl}"));
+    }
+
+    // ── 15.3b: hour transform on TIMESTAMPTZ ──────────────────────────────────
+    #[test]
+    fn t15_3b_timestamptz_partition_hour_transform() {
+        if !pg_reachable() {
+            eprintln!("SKIP t15_3b: postgres not reachable");
+            return;
+        }
+        preflight();
+
+        let id = test_id("bf15_3b");
+        let pg_tbl = format!("bf_tstz_hr_{id}");
+        let ns = format!("bf_{id}");
+        let iceberg_tbl = "bf_tstz_hour";
+        let full = format!("{ns}.{iceberg_tbl}");
+
+        cli(&["create-namespace", "--namespace", &ns]);
+
+        pg_exec(&format!(
+            "CREATE TABLE {pg_tbl} ( \
+               id       BIGSERIAL   PRIMARY KEY, \
+               label    TEXT        NOT NULL, \
+               event_ts TIMESTAMPTZ NOT NULL \
+             )"
+        ));
+
+        // Insert 4 rows all within the same UTC hour (2024-06-15 09:xx).
+        for i in 1i64..=4 {
+            pg_exec(&format!(
+                "INSERT INTO {pg_tbl} (label, event_ts) VALUES \
+                 ('hr_row{i}', TIMESTAMPTZ '2024-06-15 09:00:00+00' + INTERVAL '{i} minutes')"
+            ));
+        }
+
+        let sql = format!("SELECT id, label, event_ts FROM {pg_tbl} ORDER BY event_ts ASC, id ASC");
+        // iceberg_partition with hour transform on TIMESTAMPTZ — previously panicked.
+        let extra = "watermark_column: ~\n    batch_size: 100\n    mode: full\n    write_mode: append\n    iceberg_partition:\n      column: event_ts\n      transform: hour";
+
+        with_sync_config(
+            &sync_cfg_yaml(&pg_tbl, &ns, iceberg_tbl, &sql, extra),
+            |cfg| {
+                // Must not panic with the SafeLocationGenerator fix active.
+                assert_ok(
+                    "15.3b hour-transform TIMESTAMPTZ sync",
+                    &["sync", "--config", cfg, "--job", "bf_job"],
+                );
+                assert_eq!(
+                    scan_row_count(&full),
+                    4,
+                    "15.3b: expected 4 rows after hour-partition sync"
+                );
+            },
+        );
+
+        pg_exec(&format!("DROP TABLE IF EXISTS {pg_tbl}"));
+    }
+
+    // ── 15.3c: plain TIMESTAMP (no tz) column as iceberg_partition ───────────
+    //
+    // Ensures the SafeLocationGenerator fix also works for TIMESTAMP (no tz)
+    // columns, which produce PrimitiveType::Timestamp in the Iceberg schema.
+    #[test]
+    fn t15_3c_timestamp_no_tz_partition_month_transform() {
+        if !pg_reachable() {
+            eprintln!("SKIP t15_3c: postgres not reachable");
+            return;
+        }
+        preflight();
+
+        let id = test_id("bf15_3c");
+        let pg_tbl = format!("bf_ts_mo_{id}");
+        let ns = format!("bf_{id}");
+        let iceberg_tbl = "bf_ts_month";
+        let full = format!("{ns}.{iceberg_tbl}");
+
+        cli(&["create-namespace", "--namespace", &ns]);
+
+        pg_exec(&format!(
+            "CREATE TABLE {pg_tbl} ( \
+               id       BIGSERIAL  PRIMARY KEY, \
+               label    TEXT       NOT NULL, \
+               event_ts TIMESTAMP  NOT NULL \
+             )"
+        ));
+
+        // Two months of data: Jan and Feb 2023.
+        for i in 1i64..=3 {
+            pg_exec(&format!(
+                "INSERT INTO {pg_tbl} (label, event_ts) VALUES \
+                 ('jan_{i}', TIMESTAMP '2023-01-{i:02} 12:00:00')"
+            ));
+        }
+        for i in 1i64..=2 {
+            pg_exec(&format!(
+                "INSERT INTO {pg_tbl} (label, event_ts) VALUES \
+                 ('feb_{i}', TIMESTAMP '2023-02-{i:02} 12:00:00')"
+            ));
+        }
+
+        let sql = format!("SELECT id, label, event_ts FROM {pg_tbl} ORDER BY event_ts ASC, id ASC");
+        // TIMESTAMP (no tz) with month transform — also previously panicked.
+        let extra = "watermark_column: ~\n    batch_size: 100\n    mode: full\n    write_mode: append\n    iceberg_partition:\n      column: event_ts\n      transform: month";
+
+        with_sync_config(
+            &sync_cfg_yaml(&pg_tbl, &ns, iceberg_tbl, &sql, extra),
+            |cfg| {
+                assert_ok(
+                    "15.3c month-transform TIMESTAMP (no tz) sync",
+                    &["sync", "--config", cfg, "--job", "bf_job"],
+                );
+                assert_eq!(
+                    scan_row_count(&full),
+                    5,
+                    "15.3c: expected 5 rows (3 Jan + 2 Feb)"
+                );
+            },
+        );
+
+        pg_exec(&format!("DROP TABLE IF EXISTS {pg_tbl}"));
+    }
+
+    // =========================================================================
+    // § 15.4 — Consistency: watermark_type + cursor_type used together
+    //
+    // Combines both bug fixes in a single job config to verify they do not
+    // interfere with each other:
+    //   - watermark_type: timestamp  (TIMESTAMP column, no tz)
+    //   - cursor_type: text          (TEXT column)
+    //
+    // This is the exact shape of the `vnd_lfa1_sync` job from the bug report.
+    // =========================================================================
+    #[test]
+    fn t15_4_timestamp_watermark_and_text_cursor_combined() {
+        if !pg_reachable() {
+            eprintln!("SKIP t15_4: postgres not reachable");
+            return;
+        }
+        preflight();
+
+        let id = test_id("bf15_4");
+        let pg_tbl = format!("bf_combined_{id}");
+        let ns = format!("bf_{id}");
+        let iceberg_tbl = "bf_combined";
+        let full = format!("{ns}.{iceberg_tbl}");
+
+        cli(&["create-namespace", "--namespace", &ns]);
+
+        // TIMESTAMP (no tz) watermark + TEXT cursor, mimicking uuid_v7_id.
+        pg_exec(&format!(
+            "CREATE TABLE {pg_tbl} ( \
+               uuid_v7_id  TEXT        PRIMARY KEY, \
+               payload     TEXT        NOT NULL, \
+               update_time TIMESTAMP   NOT NULL \
+             )"
+        ));
+        pg_exec(&format!(
+            "CREATE INDEX ON {pg_tbl}(update_time, uuid_v7_id)"
+        ));
+
+        // Insert 7 rows — batch_size=3 forces multi-page cursor pagination.
+        for i in 1i64..=7 {
+            pg_exec(&format!(
+                "INSERT INTO {pg_tbl} (uuid_v7_id, payload, update_time) VALUES \
+                 ('UUIDV7-{i:04}', 'data_{i}', \
+                  TIMESTAMP '2023-09-01 00:00:00' + INTERVAL '{i} minutes')"
+            ));
+        }
+
+        let sql = format!(
+            "SELECT uuid_v7_id, payload, update_time \
+             FROM {pg_tbl} \
+             WHERE update_time > :watermark \
+             ORDER BY update_time, uuid_v7_id"
+        );
+        // Both fixes active simultaneously.
+        let extra = "watermark_column: update_time\n    watermark_type: timestamp\n    cursor_column: uuid_v7_id\n    cursor_type: text\n    batch_size: 3\n    mode: incremental\n    write_mode: append";
+
+        with_sync_config(
+            &sync_cfg_yaml(&pg_tbl, &ns, iceberg_tbl, &sql, extra),
+            |cfg| {
+                // First sync — must succeed without type-mismatch errors.
+                assert_ok(
+                    "15.4 first sync (combined fixes)",
+                    &["sync", "--config", cfg, "--job", "bf_job"],
+                );
+                assert_eq!(
+                    scan_row_count(&full),
+                    7,
+                    "15.4 first sync: expected all 7 rows"
+                );
+
+                // Incremental: add 2 more rows at later timestamps.
+                for i in 8i64..=9 {
+                    pg_exec(&format!(
+                        "INSERT INTO {pg_tbl} (uuid_v7_id, payload, update_time) VALUES \
+                     ('UUIDV7-{i:04}', 'data_{i}', \
+                      TIMESTAMP '2023-10-01 00:00:00' + INTERVAL '{i} minutes')"
+                    ));
+                }
+                assert_ok(
+                    "15.4 incremental sync",
+                    &["sync", "--config", cfg, "--job", "bf_job"],
+                );
+                assert_eq!(
+                    scan_row_count(&full),
+                    9,
+                    "15.4 incremental: expected 9 total rows (7+2)"
+                );
+
+                // Noop re-run.
+                assert_ok(
+                    "15.4 noop sync",
+                    &["sync", "--config", cfg, "--job", "bf_job"],
+                );
+                assert_eq!(scan_row_count(&full), 9, "15.4 noop: expected still 9 rows");
+            },
+        );
+
+        pg_exec(&format!("DROP TABLE IF EXISTS {pg_tbl}"));
+    }
+}

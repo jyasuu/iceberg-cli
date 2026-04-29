@@ -327,7 +327,26 @@ pub struct SyncJob {
     pub sql: String,
 
     pub watermark_column: Option<String>,
+    /// Postgres column type for the watermark parameter binding.
+    ///
+    /// - `timestamptz` (default) — sends `DateTime<Utc>` for a `TIMESTAMPTZ` column.
+    /// - `timestamp`             — sends `NaiveDateTime` for a plain `TIMESTAMP` column.
+    ///
+    /// Error symptom when wrong: `cannot convert between the Rust type
+    /// chrono::datetime::DateTime<Utc> and the Postgres type 'timestamp'`
+    #[serde(default)]
+    pub watermark_type: WatermarkType,
+
     pub cursor_column: Option<String>,
+    /// Postgres column type for the `:_cursor` parameter binding.
+    ///
+    /// - `int` (default) — sends `i64`; use for `BIGINT`/`INTEGER` cursor columns.
+    /// - `text`          — sends `String`; use for `TEXT`/`VARCHAR` cursor columns.
+    ///
+    /// Error symptom when wrong: `cannot convert between the Rust type i64
+    /// and the Postgres type 'text'`
+    #[serde(default)]
+    pub cursor_type: CursorType,
     pub depends_on: Option<String>,
 
     #[serde(default = "default_batch_size")]
@@ -383,6 +402,32 @@ pub enum SyncMode {
     Full,
 }
 
+/// How the `:watermark` SQL parameter is bound to Postgres.
+///
+/// Choose based on the column type in your source table:
+/// - `TIMESTAMPTZ` → `timestamptz` (default)
+/// - `TIMESTAMP` (no tz) → `timestamp`
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WatermarkType {
+    #[default]
+    Timestamptz,
+    Timestamp,
+}
+
+/// How the `:_cursor` SQL parameter is bound to Postgres.
+///
+/// Choose based on the cursor column type in your source table:
+/// - `BIGINT`/`INTEGER` → `int` (default)
+/// - `TEXT`/`VARCHAR`   → `text`
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorType {
+    #[default]
+    Int,
+    Text,
+}
+
 // ── RabbitMQ ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -396,6 +441,16 @@ pub struct QueueBinding {
     pub queue: String,
     pub job: String,
     pub dead_letter_exchange: Option<String>,
+}
+
+// ── Public helpers ─────────────────────────────────────────────────────────────
+
+/// Parse and validate a YAML configuration string into a [`SyncConfig`].
+#[allow(dead_code)]
+pub fn parse(yaml: &str) -> anyhow::Result<SyncConfig> {
+    let cfg: SyncConfig = serde_yaml::from_str(yaml)?;
+    cfg.validate()?;
+    Ok(cfg)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

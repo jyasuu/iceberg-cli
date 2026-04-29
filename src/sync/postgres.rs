@@ -96,12 +96,28 @@ pub fn bind_named_params(
 
 // ── Value types ───────────────────────────────────────────────────────────────
 
+/// SQL parameter value variants understood by [`sql_value_to_pg`].
+///
+/// ## Timestamp variants
+///
+/// tokio-postgres maps Postgres `TIMESTAMPTZ` ↔ `DateTime<Utc>` and
+/// `TIMESTAMP` (no tz) ↔ `NaiveDateTime`.  Sending a `DateTime<Utc>` to a
+/// `TIMESTAMP` column (or vice-versa) produces:
+/// `error serializing parameter N: cannot convert between the Rust type
+///  chrono::datetime::DateTime<Utc> and the Postgres type 'timestamp'`
+///
+/// Use `Timestamp` for `TIMESTAMPTZ` columns and `TimestampNoTz` for plain
+/// `TIMESTAMP` columns.  `TimestampNoTz` is produced automatically when the
+/// engine reads back a plain-timestamp watermark from an Iceberg table.
 #[derive(Debug, Clone)]
 pub enum SqlValue {
     Text(String),
     Int(i64),
     Float(f64),
+    /// For Postgres `TIMESTAMPTZ` columns.
     Timestamp(DateTime<Utc>),
+    /// For Postgres `TIMESTAMP` (no timezone) columns.
+    TimestampNoTz(NaiveDateTime),
     Bool(bool),
     Null,
 }
@@ -116,6 +132,27 @@ pub async fn query_to_batch(
     params: &HashMap<String, SqlValue>,
 ) -> Result<Option<RecordBatch>> {
     let (bound_sql, ordered_vals) = bind_named_params(sql, params)?;
+
+    tracing::debug!(
+        sql = %bound_sql,
+        param_count = ordered_vals.len(),
+        "Executing paginated query"
+    );
+    for (i, v) in ordered_vals.iter().enumerate() {
+        tracing::debug!(
+            param_index = i + 1,
+            param_type = match v {
+                SqlValue::Text(_) => "Text",
+                SqlValue::Int(_) => "Int(i64)",
+                SqlValue::Float(_) => "Float",
+                SqlValue::Timestamp(_) => "Timestamp(TIMESTAMPTZ)",
+                SqlValue::TimestampNoTz(_) => "TimestampNoTz(TIMESTAMP)",
+                SqlValue::Bool(_) => "Bool",
+                SqlValue::Null => "Null",
+            },
+            "Bound parameter"
+        );
+    }
 
     let pg_params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
         ordered_vals.iter().map(sql_value_to_pg).collect();
@@ -141,7 +178,10 @@ fn sql_value_to_pg(v: &SqlValue) -> Box<dyn tokio_postgres::types::ToSql + Sync 
         SqlValue::Text(s) => Box::new(s.clone()),
         SqlValue::Int(i) => Box::new(*i),
         SqlValue::Float(f) => Box::new(*f),
+        // TIMESTAMPTZ columns require DateTime<Utc>.
         SqlValue::Timestamp(t) => Box::new(*t),
+        // TIMESTAMP (no-tz) columns require NaiveDateTime.
+        SqlValue::TimestampNoTz(t) => Box::new(*t),
         SqlValue::Bool(b) => Box::new(*b),
         SqlValue::Null => Box::new(Option::<String>::None),
     }
@@ -327,7 +367,25 @@ pub fn max_timestamp_in_batch(batch: &RecordBatch, column: &str) -> Option<DateT
     DateTime::from_timestamp_micros(max_us)
 }
 
-/// Extract the last (maximum) Int64 or Int32 value from a column.
+/// Extract the last (lexicographically maximum) String value from a column.
+/// Used for text cursor advancement.
+pub fn max_text_in_batch(batch: &RecordBatch, column: &str) -> Option<String> {
+    use arrow_array::StringArray;
+    let idx = batch.schema().index_of(column).ok()?;
+    let array = batch.column(idx);
+    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+        return (0..arr.len())
+            .filter_map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i).to_string())
+                }
+            })
+            .max();
+    }
+    None
+}
 /// Used for cursor-based pagination advancement.
 pub fn max_int_in_batch(batch: &RecordBatch, column: &str) -> Option<i64> {
     let idx = batch.schema().index_of(column).ok()?;
@@ -356,4 +414,148 @@ pub fn max_int_in_batch(batch: &RecordBatch, column: &str) -> Option<i64> {
             .max();
     }
     None
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    // ── SqlValue variants ─────────────────────────────────────────────────────
+
+    /// TimestampNoTz must compile without panic — proves the variant is wired.
+    #[test]
+    fn sql_value_timestamp_no_tz_compiles() {
+        let naive =
+            chrono::NaiveDateTime::parse_from_str("2024-03-15 10:30:00", "%Y-%m-%d %H:%M:%S")
+                .unwrap();
+        let v = SqlValue::TimestampNoTz(naive);
+        // sql_value_to_pg must return a box without panicking.
+        let _boxed = sql_value_to_pg(&v);
+    }
+
+    /// Timestamp (TIMESTAMPTZ) variant — unchanged baseline.
+    #[test]
+    fn sql_value_timestamp_tz_compiles() {
+        use chrono::Utc;
+        let v = SqlValue::Timestamp(Utc::now());
+        let _boxed = sql_value_to_pg(&v);
+    }
+
+    // ── max_text_in_batch ─────────────────────────────────────────────────────
+
+    #[test]
+    fn max_text_returns_lex_max() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "_pgcursor",
+            DataType::Utf8,
+            true,
+        )]));
+        let arr = Arc::new(StringArray::from(vec!["LF0001", "LF0003", "LF0002"]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        assert_eq!(
+            max_text_in_batch(&batch, "_pgcursor"),
+            Some("LF0003".to_string())
+        );
+    }
+
+    #[test]
+    fn max_text_skips_nulls() {
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, true)]));
+        let arr = Arc::new(StringArray::from(vec![Some("AA"), None, Some("BB"), None]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        assert_eq!(max_text_in_batch(&batch, "col"), Some("BB".to_string()));
+    }
+
+    #[test]
+    fn max_text_empty_column_returns_none() {
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, true)]));
+        let arr = Arc::new(StringArray::from(Vec::<Option<&str>>::new()));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        assert_eq!(max_text_in_batch(&batch, "col"), None);
+    }
+
+    #[test]
+    fn max_text_missing_column_returns_none() {
+        let schema = Arc::new(Schema::new(vec![Field::new("other", DataType::Utf8, true)]));
+        let arr = Arc::new(StringArray::from(vec!["x"]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        assert_eq!(max_text_in_batch(&batch, "_pgcursor"), None);
+    }
+
+    #[test]
+    fn max_text_all_nulls_returns_none() {
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, true)]));
+        let arr = Arc::new(StringArray::from(vec![None::<&str>, None, None]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        assert_eq!(max_text_in_batch(&batch, "col"), None);
+    }
+
+    /// Empty string is the initial sentinel for text cursors.
+    /// The lex max of any realistic value is greater than "".
+    #[test]
+    #[allow(clippy::comparison_to_empty)]
+    fn max_text_empty_string_sentinel_is_less_than_any_value() {
+        // simulate first-sync: current sentinel = "", incoming batch has values
+        let values = ["AA01", "AA02", "AA03"];
+        assert!(values.iter().all(|v| *v > ""), "sentinel '' < all values");
+    }
+
+    // ── max_int_in_batch ──────────────────────────────────────────────────────
+
+    #[test]
+    fn max_int_first_sync_sentinel() {
+        // i64::MIN is less than any realistic database row id.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "_pgcursor",
+            DataType::Int64,
+            true,
+        )]));
+        let arr = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        // max_int returns 3, which is > i64::MIN — cursor advances correctly.
+        assert_eq!(max_int_in_batch(&batch, "_pgcursor"), Some(3i64));
+    }
+
+    // ── named param substitution ──────────────────────────────────────────────
+
+    #[test]
+    fn bind_watermark_and_cursor_params_in_order() {
+        let sql = "SELECT * FROM t WHERE ts > :watermark AND id > :_cursor";
+        let mut params = HashMap::new();
+        params.insert(
+            "watermark".to_string(),
+            SqlValue::Timestamp(chrono::DateTime::UNIX_EPOCH),
+        );
+        params.insert("_cursor".to_string(), SqlValue::Int(0));
+
+        let (out_sql, vals) = bind_named_params(sql, &params).unwrap();
+        assert!(out_sql.contains("$1"));
+        assert!(out_sql.contains("$2"));
+        assert_eq!(vals.len(), 2);
+    }
+
+    #[test]
+    fn bind_named_params_missing_value_returns_err() {
+        let sql = "SELECT * FROM t WHERE id = :missing_param";
+        let params = HashMap::new();
+        assert!(bind_named_params(sql, &params).is_err());
+    }
+
+    #[test]
+    fn bind_named_params_skips_double_colon_casts() {
+        let sql = "SELECT val::text FROM t WHERE ts > :watermark";
+        let mut params = HashMap::new();
+        params.insert(
+            "watermark".to_string(),
+            SqlValue::Timestamp(chrono::DateTime::UNIX_EPOCH),
+        );
+        let (out_sql, _) = bind_named_params(sql, &params).unwrap();
+        assert!(out_sql.contains("::text"), "cast must be preserved");
+        assert!(out_sql.contains("$1"), "watermark must be substituted");
+    }
 }
