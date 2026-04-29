@@ -284,8 +284,7 @@ mod tests {
     #[test]
     fn watermark_type_timestamp_parses_from_yaml() {
         use crate::config::{WatermarkType, parse};
-        let yaml = format!(
-            r#"
+        let yaml = r#"
 sources:
   pg:
     type: postgres
@@ -307,7 +306,7 @@ sync_jobs:
     watermark_type: timestamp
     mode: incremental
 "#
-        );
+        .to_string();
         let cfg = parse(&yaml).unwrap();
         assert_eq!(cfg.sync_jobs[0].watermark_type, WatermarkType::Timestamp);
     }
@@ -315,8 +314,7 @@ sync_jobs:
     #[test]
     fn cursor_type_text_parses_from_yaml() {
         use crate::config::{CursorType, parse};
-        let yaml = format!(
-            r#"
+        let yaml = r#"
 sources:
   pg:
     type: postgres
@@ -339,7 +337,7 @@ sync_jobs:
     cursor_type: text
     mode: incremental
 "#
-        );
+        .to_string();
         let cfg = parse(&yaml).unwrap();
         assert_eq!(cfg.sync_jobs[0].cursor_type, CursorType::Text);
     }

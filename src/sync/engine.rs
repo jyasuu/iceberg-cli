@@ -70,7 +70,8 @@ use crate::sync::{
     // file_name::ProductionFileNameGenerator,
     metadata::{RunSummary, build_metadata_updates, read_watermark},
     postgres::{
-        SqlValue, connect as pg_connect, max_int_in_batch, max_text_in_batch, max_timestamp_in_batch, query_to_batch,
+        SqlValue, connect as pg_connect, max_int_in_batch, max_text_in_batch,
+        max_timestamp_in_batch, query_to_batch,
     },
     write_strategies::{
         apply_plan_to_transaction, plan_append, plan_merge_into, plan_overwrite, plan_upsert,
@@ -217,7 +218,10 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
                     }
                     CursorType::Text => {
                         tracing::debug!(cursor = %cursor_text_value, "Binding :_cursor as Text");
-                        params.insert("_cursor".to_string(), SqlValue::Text(cursor_text_value.clone()));
+                        params.insert(
+                            "_cursor".to_string(),
+                            SqlValue::Text(cursor_text_value.clone()),
+                        );
                     }
                 }
             }

@@ -152,10 +152,7 @@ impl SafeLocationGenerator {
     ///
     /// `partition_value_us` is ignored for non-temporal specs; pass `0` when
     /// the table is unpartitioned.
-    pub fn new(
-        meta: &TableMetadata,
-        partition_value_us: i64,
-    ) -> anyhow::Result<Self> {
+    pub fn new(meta: &TableMetadata, partition_value_us: i64) -> anyhow::Result<Self> {
         use iceberg::spec::PrimitiveType;
 
         let table_location = meta.location().to_string();
@@ -209,7 +206,8 @@ impl SafeLocationGenerator {
         // they are joined with `/`.
         let mut parts: Vec<String> = Vec::new();
         for field in spec.fields() {
-            let segment = compute_temporal_segment(&field.name, field.transform, partition_value_us);
+            let segment =
+                compute_temporal_segment(&field.name, field.transform, partition_value_us);
             parts.push(segment);
         }
         let partition_segment = parts.join("/");
@@ -237,7 +235,10 @@ impl LocationGenerator for SafeLocationGenerator {
             // otherwise partition_segment is set and we use the manual path.
             self.inner.generate_location(partition_key, file_name)
         } else {
-            format!("{}/data/{}/{}", self.table_location, self.partition_segment, file_name)
+            format!(
+                "{}/data/{}/{}",
+                self.table_location, self.partition_segment, file_name
+            )
         }
     }
 }

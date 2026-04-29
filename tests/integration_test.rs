@@ -3247,7 +3247,7 @@ mod bugfix {
     }
 
     fn sync_cfg_yaml(
-        pg_tbl: &str,
+        _pg_tbl: &str,
         ns: &str,
         iceberg_tbl: &str,
         sql: &str,

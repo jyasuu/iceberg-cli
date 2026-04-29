@@ -172,7 +172,16 @@ pub async fn plan_overwrite(job: &SyncJob, table: &Table, batch: RecordBatch) ->
     let n = batch.num_rows();
 
     // Collect the distinct partition values present in the incoming batch.
-    let incoming_parts = extract_string_column_values(&batch, part_col)
+    // `incoming_parts_raw` uses the raw Arrow value as a string (e.g. raw µs
+    // for timestamp columns) and is used for:
+    //   • `build_partition_predicate`  (parses µs as i64 → Datum::long)
+    //   • `partition_filter`           (scalar_to_string also yields raw µs)
+    //
+    // `incoming_parts_canonical` uses the *post-transform* canonical format
+    // (e.g. "2024-05-10" for Day, "2024-05" for Month) and is used for:
+    //   • `collect_non_partition_files` → `partition_matches` →
+    //     `literal_primitive_to_string`, which produces the same canonical form.
+    let incoming_parts_raw = extract_string_column_values(&batch, part_col)
         .context("Overwrite: failed to extract incoming partition values")?;
 
     // ── Route: native Iceberg partition spec vs. legacy string-equality scan ──
@@ -210,9 +219,12 @@ pub async fn plan_overwrite(job: &SyncJob, table: &Table, batch: RecordBatch) ->
         // them together.  The scan executor uses the PartitionSpec to prune
         // manifest entries before reading any Parquet, so only files that
         // overlap the target partition are opened.
-        let predicate =
-            build_partition_predicate(part_col, &incoming_parts, table.metadata().current_schema())
-                .context("Overwrite: failed to build partition predicate for scan pushdown")?;
+        let predicate = build_partition_predicate(
+            part_col,
+            &incoming_parts_raw,
+            table.metadata().current_schema(),
+        )
+        .context("Overwrite: failed to build partition predicate for scan pushdown")?;
 
         // Step 2: Scan only the target partition's rows.
         let target_rows = scan_table_with_predicate(table, predicate)
@@ -221,7 +233,23 @@ pub async fn plan_overwrite(job: &SyncJob, table: &Table, batch: RecordBatch) ->
 
         // Step 3: Collect DataFiles for all OTHER partitions from the manifest.
         // These are passed through unchanged — we never read their rows.
-        let untouched = collect_non_partition_files(table, part_col, &incoming_parts)
+        //
+        // IMPORTANT: `partition_matches` compares DataFile partition literals
+        // (formatted by `literal_primitive_to_string`) against this set.  For
+        // temporal transforms the literal is stored post-transform — e.g. a Day
+        // transform yields days-since-epoch rendered as "2024-05-10", NOT the raw
+        // microsecond integer.  We must therefore build a *canonical* value set
+        // that matches that format, distinct from `incoming_parts_raw` which uses
+        // raw Arrow scalar strings.
+        let incoming_parts_canonical = extract_canonical_partition_values(
+            &batch,
+            part_col,
+            table.metadata().default_partition_spec(),
+            table.metadata().current_schema(),
+        )
+        .context("Overwrite: failed to extract canonical partition values for manifest scan")?;
+
+        let untouched = collect_non_partition_files(table, part_col, &incoming_parts_canonical)
             .await
             .context("Overwrite: failed to collect non-target-partition DataFiles")?;
 
@@ -230,7 +258,7 @@ pub async fn plan_overwrite(job: &SyncJob, table: &Table, batch: RecordBatch) ->
         let mut survivors: Vec<RecordBatch> = Vec::new();
         let mut rows_removed = 0usize;
         for existing_batch in target_rows {
-            let (kept, dropped) = partition_filter(&existing_batch, part_col, &incoming_parts)
+            let (kept, dropped) = partition_filter(&existing_batch, part_col, &incoming_parts_raw)
                 .context("Overwrite: failed to filter target partition rows")?;
             rows_removed += dropped;
             if let Some(kept_batch) = kept {
@@ -273,7 +301,7 @@ pub async fn plan_overwrite(job: &SyncJob, table: &Table, batch: RecordBatch) ->
         let mut survivors: Vec<RecordBatch> = Vec::new();
         let mut rows_removed = 0usize;
         for existing_batch in existing {
-            let (kept, dropped) = partition_filter(&existing_batch, part_col, &incoming_parts)
+            let (kept, dropped) = partition_filter(&existing_batch, part_col, &incoming_parts_raw)
                 .context("Overwrite: failed to filter existing rows by partition")?;
             rows_removed += dropped;
             if let Some(kept_batch) = kept {
@@ -1073,7 +1101,7 @@ fn build_partition_key_for_batch(
                         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
                         let d = epoch
                             + chrono::Duration::try_days(days).unwrap_or(chrono::Duration::zero());
-                        let months = (d.year() as i32 - 1970) * 12 + (d.month() as i32 - 1);
+                        let months = (d.year() - 1970) * 12 + (d.month() as i32 - 1);
                         Literal::int(months)
                     }
                     Transform::Year => {
@@ -1081,7 +1109,7 @@ fn build_partition_key_for_batch(
                         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
                         let d = epoch
                             + chrono::Duration::try_days(days).unwrap_or(chrono::Duration::zero());
-                        let years = d.year() as i32 - 1970;
+                        let years = d.year() - 1970;
                         Literal::int(years)
                     }
                     // Identity or other non-temporal transforms: raw source literal.
@@ -1770,6 +1798,115 @@ fn extract_string_column_values(
     Ok(values)
 }
 
+/// Extract unique *canonical* partition value strings from `col_name` in
+/// `batch`, applying the same post-transform formatting used by
+/// [`literal_primitive_to_string`] so that the resulting set can be compared
+/// directly against DataFile partition literals loaded from Iceberg manifests.
+///
+/// For temporal transforms the canonical format is:
+/// - `Day`   → "YYYY-MM-DD" (days since epoch → date string)
+/// - `Month` → "YYYY-MM"    (months since epoch → year-month string)
+/// - `Year`  → "YYYY"       (years since epoch → year string)
+/// - `Hour`  → raw integer string (hours since epoch)
+///
+/// For all other types/transforms the raw `scalar_to_string` value is used,
+/// which matches the string format stored in partition literals for identity /
+/// non-temporal transforms.
+///
+/// This is intentionally *different* from [`extract_string_column_values`],
+/// which returns raw Arrow scalars (e.g. raw µs for timestamps).  The raw form
+/// is correct for `partition_filter` and `build_partition_predicate`; the
+/// canonical form is required for `collect_non_partition_files` /
+/// `partition_matches`.
+fn extract_canonical_partition_values(
+    batch: &RecordBatch,
+    col_name: &str,
+    spec: &PartitionSpec,
+    schema: &iceberg::spec::Schema,
+) -> Result<std::collections::HashSet<String>> {
+    use arrow_array::TimestampMicrosecondArray;
+
+    let idx = batch.schema().index_of(col_name).with_context(|| {
+        format!(
+            "extract_canonical_partition_values: column '{}' not found in batch",
+            col_name
+        )
+    })?;
+    let col = batch.column(idx);
+
+    // Find the transform for this column by matching the source field id.
+    let source_field = schema.field_by_name(col_name);
+    let transform = source_field.and_then(|sf| {
+        spec.fields()
+            .iter()
+            .find(|pf| pf.source_id == sf.id)
+            .map(|pf| pf.transform)
+    });
+
+    let source_type = source_field.and_then(|sf| sf.field_type.as_primitive_type().cloned());
+
+    let mut values = std::collections::HashSet::new();
+
+    // For timestamp columns with a temporal transform, produce the same string
+    // that `literal_primitive_to_string` produces for the stored partition literal.
+    if matches!(
+        source_type,
+        Some(PrimitiveType::Timestamp) | Some(PrimitiveType::Timestamptz)
+    ) && let Some(arr) = col.as_any().downcast_ref::<TimestampMicrosecondArray>()
+    {
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                continue;
+            }
+            let us: i64 = arr.value(i);
+            let s = match &transform {
+                Some(Transform::Day) => {
+                    let days = us / 86_400_000_000_i64;
+                    match epoch.checked_add_signed(chrono::Duration::days(days)) {
+                        Some(d) => d.format("%Y-%m-%d").to_string(),
+                        None => days.to_string(),
+                    }
+                }
+                Some(Transform::Month) => {
+                    let days = us / 86_400_000_000_i64;
+                    let d = epoch
+                        + chrono::Duration::try_days(days).unwrap_or(chrono::Duration::zero());
+                    let total_months = (d.year() as i64 - 1970) * 12 + (d.month() as i64 - 1);
+                    let abs_months = 1970i64 * 12 + total_months;
+                    let year = abs_months.div_euclid(12);
+                    let month = abs_months.rem_euclid(12) + 1;
+                    format!("{year:04}-{month:02}")
+                }
+                Some(Transform::Year) => {
+                    let days = us / 86_400_000_000_i64;
+                    let d = epoch
+                        + chrono::Duration::try_days(days).unwrap_or(chrono::Duration::zero());
+                    format!("{:04}", d.year())
+                }
+                Some(Transform::Hour) => {
+                    // Hours since epoch — stored as raw int in the literal.
+                    let hours = us / 3_600_000_000_i64;
+                    hours.to_string()
+                }
+                // Identity or other: fall through to scalar_to_string below.
+                _ => scalar_to_string(col.as_ref(), i),
+            };
+            values.insert(s);
+        }
+        return Ok(values);
+    }
+
+    // Non-timestamp columns (Date32, String, Int64, Int32, …): the stored
+    // partition literal IS the source value, so scalar_to_string already
+    // matches literal_primitive_to_string for Identity/Day-on-Date transforms.
+    for i in 0..col.len() {
+        values.insert(scalar_to_string(col.as_ref(), i));
+    }
+
+    Ok(values)
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 /// Extract the raw microsecond timestamp of the first row's partition column.
@@ -1813,10 +1950,10 @@ fn extract_partition_timestamp_us(table: &iceberg::table::Table, batch: &RecordB
         let col_name = &source_field.name;
         if let Ok(idx) = batch.schema().index_of(col_name) {
             let col = batch.column(idx);
-            if let Some(arr) = col.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-                if !arr.is_null(0) {
-                    return arr.value(0);
-                }
+            if let Some(arr) = col.as_any().downcast_ref::<TimestampMicrosecondArray>()
+                && !arr.is_null(0)
+            {
+                return arr.value(0);
             }
         }
     }

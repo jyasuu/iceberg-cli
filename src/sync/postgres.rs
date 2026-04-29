@@ -142,13 +142,13 @@ pub async fn query_to_batch(
         tracing::debug!(
             param_index = i + 1,
             param_type = match v {
-                SqlValue::Text(_)         => "Text",
-                SqlValue::Int(_)          => "Int(i64)",
-                SqlValue::Float(_)        => "Float",
-                SqlValue::Timestamp(_)    => "Timestamp(TIMESTAMPTZ)",
-                SqlValue::TimestampNoTz(_)=> "TimestampNoTz(TIMESTAMP)",
-                SqlValue::Bool(_)         => "Bool",
-                SqlValue::Null            => "Null",
+                SqlValue::Text(_) => "Text",
+                SqlValue::Int(_) => "Int(i64)",
+                SqlValue::Float(_) => "Float",
+                SqlValue::Timestamp(_) => "Timestamp(TIMESTAMPTZ)",
+                SqlValue::TimestampNoTz(_) => "TimestampNoTz(TIMESTAMP)",
+                SqlValue::Bool(_) => "Bool",
+                SqlValue::Null => "Null",
             },
             "Bound parameter"
         );
@@ -466,12 +466,7 @@ mod tests {
     #[test]
     fn max_text_skips_nulls() {
         let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, true)]));
-        let arr = Arc::new(StringArray::from(vec![
-            Some("AA"),
-            None,
-            Some("BB"),
-            None,
-        ]));
+        let arr = Arc::new(StringArray::from(vec![Some("AA"), None, Some("BB"), None]));
         let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
         assert_eq!(max_text_in_batch(&batch, "col"), Some("BB".to_string()));
     }
@@ -503,9 +498,10 @@ mod tests {
     /// Empty string is the initial sentinel for text cursors.
     /// The lex max of any realistic value is greater than "".
     #[test]
+    #[allow(clippy::comparison_to_empty)]
     fn max_text_empty_string_sentinel_is_less_than_any_value() {
         // simulate first-sync: current sentinel = "", incoming batch has values
-        let values = vec!["AA01", "AA02", "AA03"];
+        let values = ["AA01", "AA02", "AA03"];
         assert!(values.iter().all(|v| *v > ""), "sentinel '' < all values");
     }
 

@@ -446,6 +446,7 @@ pub struct QueueBinding {
 // ── Public helpers ─────────────────────────────────────────────────────────────
 
 /// Parse and validate a YAML configuration string into a [`SyncConfig`].
+#[allow(dead_code)]
 pub fn parse(yaml: &str) -> anyhow::Result<SyncConfig> {
     let cfg: SyncConfig = serde_yaml::from_str(yaml)?;
     cfg.validate()?;
