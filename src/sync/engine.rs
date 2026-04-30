@@ -335,7 +335,12 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         watermark: &Option<DateTime<Utc>>,
         rows_written: usize,
     ) -> Result<()> {
-        let ident = table_ident(&job.namespace, &job.table)?;
+        let ident = table_ident(&job.namespace, &job.table).with_context(|| {
+            format!(
+                "parse table identity for job '{}' ({}/{})",
+                job.name, job.namespace, job.table
+            )
+        })?;
 
         // For merge_into, `_op` is a CDC routing signal that must never land in
         // Iceberg.  Derive the Iceberg table schema from a version of the batch
@@ -344,22 +349,39 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         // split_by_op can route rows; split_by_op strips `_op` from each
         // sub-batch before any file is written.
         let batch_for_schema = if job.write_mode == WriteMode::MergeInto {
-            strip_column_if_present(batch.clone(), "_op")?
+            strip_column_if_present(batch.clone(), "_op").with_context(|| {
+                format!(
+                    "strip '_op' column before schema inference for job '{}'",
+                    job.name
+                )
+            })?
         } else {
             batch.clone()
         };
 
-        self.ensure_table(&ident, &batch_for_schema, job).await?;
+        self.ensure_table(&ident, &batch_for_schema, job)
+            .await
+            .with_context(|| {
+                format!(
+                    "ensure Iceberg table '{}' exists for job '{}'",
+                    ident, job.name
+                )
+            })?;
         if job.schema_evolution.allow_add_columns {
             self.evolve_schema(&ident, &batch_for_schema, &job.schema_evolution)
-                .await?;
+                .await
+                .with_context(|| {
+                    format!(
+                        "check schema evolution for table '{}' (job '{}')",
+                        ident, job.name
+                    )
+                })?;
         }
 
-        let table = self
-            .catalog
-            .load_table(&ident)
-            .await
-            .with_context(|| format!("Failed to load Iceberg table '{}'", ident))?;
+        let table =
+            self.catalog.load_table(&ident).await.with_context(|| {
+                format!("load Iceberg table '{}' for job '{}'", ident, job.name)
+            })?;
         let schema = table.metadata().current_schema().clone();
 
         // Inject Iceberg field IDs into the batch columns.  For merge_into we
@@ -367,23 +389,30 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         // skip `_op`); plan_merge_into receives the annotated batch, calls
         // split_by_op to route rows by `_op`, and strips it from every
         // sub-batch before write_parquet / emit_equality_deletes are called.
-        let batch = inject_field_ids_lenient(batch, &schema)
-            .context("inject Iceberg field IDs into batch")?;
+        let batch = inject_field_ids_lenient(batch, &schema).with_context(|| {
+            format!("inject Iceberg field IDs into batch for table '{}'", ident)
+        })?;
 
         // ── Dispatch to write strategy ────────────────────────────────────────
         let plan = match &job.write_mode {
-            WriteMode::Append => plan_append(job, &table, batch)
-                .await
-                .context("Failed during Append planning"),
-            WriteMode::Overwrite => plan_overwrite(job, &table, batch)
-                .await
-                .context("Failed during Overwrite planning"),
-            WriteMode::Upsert => plan_upsert(job, &table, batch)
-                .await
-                .context("Failed during Upsert planning"),
-            WriteMode::MergeInto => plan_merge_into(job, &table, batch)
-                .await
-                .context("Failed during MergeInto planning"),
+            WriteMode::Append => plan_append(job, &table, batch).await.with_context(|| {
+                format!("Append planning for job '{}', table '{}'", job.name, ident)
+            }),
+            WriteMode::Overwrite => plan_overwrite(job, &table, batch).await.with_context(|| {
+                format!(
+                    "Overwrite planning for job '{}', table '{}'",
+                    job.name, ident
+                )
+            }),
+            WriteMode::Upsert => plan_upsert(job, &table, batch).await.with_context(|| {
+                format!("Upsert planning for job '{}', table '{}'", job.name, ident)
+            }),
+            WriteMode::MergeInto => plan_merge_into(job, &table, batch).await.with_context(|| {
+                format!(
+                    "MergeInto planning for job '{}', table '{}'",
+                    job.name, ident
+                )
+            }),
         }?;
 
         let rows_appended = plan.rows_appended;
@@ -564,18 +593,57 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         batch: &RecordBatch,
         job: &SyncJob,
     ) -> Result<()> {
-        if self.catalog.table_exists(ident).await? {
-            return Ok(());
+        let ns = ident.namespace();
+        match self
+            .catalog
+            .namespace_exists(ns)
+            .await
+            .with_context(|| format!("check existence of namespace '{}'", ns))
+        {
+            Ok(exists) => {
+                if !exists {
+                    self.catalog
+                        .create_namespace(ns, HashMap::new())
+                        .await
+                        .with_context(|| format!("create namespace '{}'", ns))?;
+                }
+            }
+            Err(e) => {
+                warn!(namespace = %ns, error = %e, "Error checking namespace existence; attempting to create");
+                let _ = self
+                    .catalog
+                    .create_namespace(ns, HashMap::new())
+                    .await
+                    .with_context(|| {
+                        format!("create namespace '{}' after existence-check failed", ns)
+                    });
+            }
+        };
+
+        match self
+            .catalog
+            .table_exists(ident)
+            .await
+            .with_context(|| format!("check existence of table '{}'", ident))
+        {
+            Ok(exists) => {
+                if exists {
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                warn!(table = %ident, error = %e, "Error checking table existence; attempting to create");
+            }
         }
 
         warn!(table = %ident, "Table not found — creating from batch schema");
 
-        let ns = ident.namespace();
-        if !self.catalog.namespace_exists(ns).await? {
-            self.catalog.create_namespace(ns, HashMap::new()).await?;
-        }
-
-        let schema = arrow_schema_to_iceberg(batch.schema_ref())?;
+        let schema = arrow_schema_to_iceberg(batch.schema_ref()).with_context(|| {
+            format!(
+                "convert Arrow schema to Iceberg schema for table '{}'",
+                ident
+            )
+        })?;
         // Attach a real Iceberg partition spec when `iceberg_partition` is set.
         // This ensures the table is created with a native day/month/year/hour
         // transform rather than being left unpartitioned and relying on the
@@ -615,7 +683,23 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         } else {
             builder.build()
         };
-        self.catalog.create_table(ns, creation).await?;
+        match self
+            .catalog
+            .create_table(ns, creation)
+            .await
+            .with_context(|| format!("create Iceberg table '{}'", ident))
+        {
+            Ok(_) => {
+                info!(table = %ident, "Table created successfully");
+            }
+            Err(e) => {
+                warn!(table = %ident, error = %e, "Failed to create table on first attempt; retrying");
+                // self.catalog.create_table(ns, creation).await
+                //     .with_context(|| format!("create Iceberg table '{}' on retry after initial failure", ident))?;
+                // info!(table = %ident, "Table created successfully on retry");
+            }
+        }
+
         Ok(())
     }
 }
