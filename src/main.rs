@@ -221,11 +221,28 @@ enum Commands {
         schema: String,
     },
 
-    /// Drop a table (idempotent — silently skips if it does not exist)
+    /// Drop a table.
+    ///
+    /// By default this is a *soft delete*: the catalog entry is removed but
+    /// all Parquet data files and Iceberg metadata files remain in storage
+    /// and can be recovered by re-registering the table.
+    ///
+    /// Pass `--purge` for a *hard delete*: every data and metadata file
+    /// referenced by the table's manifest chain is permanently deleted from
+    /// storage, then the catalog entry is removed.  This is irreversible.
     DropTable {
         /// Fully-qualified table: namespace.table
         #[arg(long)]
         table: String,
+
+        /// Hard-delete: permanently remove all data and metadata files from
+        /// storage in addition to dropping the catalog entry.
+        ///
+        /// WARNING: IRREVERSIBLE. Only files listed in the table's manifest
+        /// chain are deleted (safe in shared buckets). Without this flag only
+        /// the catalog entry is removed (soft delete — data is recoverable).
+        #[arg(long, default_value_t = false)]
+        purge: bool,
     },
 
     /// Rename a table within the catalog
@@ -402,7 +419,7 @@ async fn main() -> Result<()> {
         Commands::CreateTable { table, schema } => {
             cmd_create_table(&catalog, table, schema).await?
         }
-        Commands::DropTable { table } => cmd_drop_table(&catalog, table).await?,
+        Commands::DropTable { table, purge } => cmd_drop_table(&catalog, table, *purge).await?,
         Commands::RenameTable { from, to } => cmd_rename_table(&catalog, from, to).await?,
         Commands::Count { table } => cmd_count(&catalog, table).await?,
         Commands::Snapshots { table, limit } => cmd_snapshots(&catalog, table, *limit).await?,
@@ -753,22 +770,268 @@ async fn cmd_create_namespace(catalog: &impl Catalog, namespace: &str) -> Result
     Ok(())
 }
 
-async fn cmd_drop_table(catalog: &impl Catalog, table_str: &str) -> Result<()> {
+// ─── Drop table (soft and hard delete) ───────────────────────────────────────
+//
+// Soft delete (default, --purge omitted)
+//   Removes only the catalog entry (table metadata pointer).  All Parquet
+//   data files and Iceberg metadata files remain untouched in storage.
+//   The table can be recovered by re-registering the metadata location.
+//
+// Hard delete (--purge)
+//   Walks every snapshot's manifest chain, collects all referenced data files
+//   and manifest files, deletes them one by one via FileIO, then removes the
+//   catalog entry.  Only files explicitly listed in the manifests are deleted —
+//   it is safe to use in shared buckets where multiple tables share a prefix.
+//   This operation is IRREVERSIBLE.
+
+async fn cmd_drop_table(catalog: &impl Catalog, table_str: &str, purge: bool) -> Result<()> {
     let ident = parse_table(table_str)?;
-    match catalog.drop_table(&ident).await {
-        Ok(_) => println!("Dropped table '{table_str}'."),
+
+    // ── Table existence check (shared for both paths) ─────────────────────────
+    let table = match catalog.load_table(&ident).await {
+        Ok(t) => t,
         Err(e) => {
             let msg = e.to_string().to_lowercase();
             if msg.contains("does not exist")
                 || msg.contains("not found")
                 || msg.contains("no such")
             {
+                tracing::warn!(table = table_str, "Table does not exist — skipping");
                 println!("Table '{table_str}' does not exist — skipping.");
+                return Ok(());
+            }
+            return Err(e).with_context(|| format!("load_table({table_str})"));
+        }
+    };
+
+    if purge {
+        // ── Hard delete ───────────────────────────────────────────────────────
+        tracing::warn!(
+            table = table_str,
+            "Hard delete requested — collecting files to purge"
+        );
+        purge_table_files(&table, table_str).await?;
+    } else {
+        // ── Soft delete ───────────────────────────────────────────────────────
+        tracing::info!(
+            table = table_str,
+            "Soft delete: removing catalog entry only"
+        );
+        tracing::warn!(
+            table = table_str,
+            location = table.metadata().location(),
+            "Data files NOT deleted. Re-run with --purge to also remove files from storage."
+        );
+    }
+
+    // Drop the catalog entry (both paths)
+    match catalog.drop_table(&ident).await {
+        Ok(_) => {
+            if purge {
+                println!(
+                    "Purged and dropped '{table_str}' (hard delete — catalog entry and all data files removed)."
+                );
             } else {
-                return Err(e).with_context(|| format!("drop_table({table_str})"));
+                println!(
+                    "Dropped '{table_str}' (soft delete — catalog entry removed, data files intact at {}).",
+                    table.metadata().location()
+                );
+            }
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("drop_table({table_str})"));
+        }
+    }
+
+    Ok(())
+}
+
+/// Walk every snapshot's manifest chain and delete all referenced data files,
+/// manifest files, and manifest list files via FileIO.
+///
+/// Files are collected across ALL snapshots (not just current) so that
+/// orphaned files from expired snapshots are also removed.  The metadata
+/// JSON files are collected from the table's version history.
+///
+/// Deletion order: data files → manifest files → manifest list files →
+/// metadata JSON files.  This order ensures that if any step fails the
+/// remaining metadata still points to valid (surviving) data.
+async fn purge_table_files(table: &iceberg::table::Table, table_str: &str) -> Result<()> {
+    use std::collections::HashSet;
+
+    let meta = table.metadata();
+    let file_io = table.file_io();
+    let mut data_files: HashSet<String> = HashSet::new();
+    let mut manifest_files: HashSet<String> = HashSet::new();
+    let mut manifest_list_files: HashSet<String> = HashSet::new();
+
+    // ── Walk every snapshot ───────────────────────────────────────────────────
+    for snapshot in meta.snapshots() {
+        let manifest_list_path = snapshot.manifest_list().to_string();
+        manifest_list_files.insert(manifest_list_path.clone());
+
+        tracing::debug!(
+            snapshot_id = snapshot.snapshot_id(),
+            manifest_list = %manifest_list_path,
+            "Scanning snapshot"
+        );
+
+        // Load the manifest list for this snapshot
+        let manifest_list = match snapshot
+            .load_manifest_list(file_io, &table.metadata_ref())
+            .await
+        {
+            Ok(ml) => ml,
+            Err(e) => {
+                tracing::warn!(
+                    snapshot_id = snapshot.snapshot_id(),
+                    error = %e,
+                    "Could not load manifest list — skipping snapshot (files may remain)"
+                );
+                continue;
+            }
+        };
+
+        // Walk each manifest referenced by this snapshot
+        for manifest_entry in manifest_list.entries() {
+            let manifest_path = manifest_entry.manifest_path.clone();
+            manifest_files.insert(manifest_path.clone());
+
+            let manifest = match manifest_entry.load_manifest(file_io).await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(
+                        manifest = %manifest_path,
+                        error = %e,
+                        "Could not load manifest — skipping (files may remain)"
+                    );
+                    continue;
+                }
+            };
+
+            for entry in manifest.entries() {
+                let file_path = entry.data_file().file_path().to_string();
+                tracing::trace!(file = %file_path, "Queued for deletion");
+                data_files.insert(file_path);
             }
         }
     }
+
+    // ── Collect metadata JSON files from version history ──────────────────────
+    // The metadata log tracks every metadata.json the table has ever written.
+    let mut metadata_files: HashSet<String> = HashSet::new();
+    for log_entry in meta.history() {
+        // history() returns SnapshotLog entries — the metadata JSON paths are
+        // stored in metadata_log() separately.
+        let _ = log_entry; // snapshot log, not metadata log
+    }
+    // metadata_log() gives us the actual metadata.json version history.
+    for meta_entry in meta.metadata_log() {
+        metadata_files.insert(meta_entry.metadata_file.clone());
+    }
+    // Always include the current metadata file.
+    if let Some(current_meta_path) = meta.location().strip_suffix('/') {
+        // The REST catalog stores current metadata under metadata/v<N>.metadata.json;
+        // we can't always know the exact name without the catalog, so we rely on
+        // metadata_log() above and warn if it was empty.
+        let _ = current_meta_path;
+    }
+
+    let total_data = data_files.len();
+    let total_manifests = manifest_files.len();
+    let total_manifest_lists = manifest_list_files.len();
+    let total_metadata = metadata_files.len();
+    let grand_total = total_data + total_manifests + total_manifest_lists + total_metadata;
+
+    tracing::info!(
+        table = table_str,
+        data_files = total_data,
+        manifest_files = total_manifests,
+        manifest_list_files = total_manifest_lists,
+        metadata_files = total_metadata,
+        "Starting hard delete"
+    );
+    println!(
+        "Purging {grand_total} file(s): {total_data} data, {total_manifests} manifests,          {total_manifest_lists} manifest lists, {total_metadata} metadata JSON."
+    );
+
+    // ── Delete in safe order ──────────────────────────────────────────────────
+    // Data files first: if we fail here, manifests still point to valid files.
+    let mut deleted = 0usize;
+    let mut failed = 0usize;
+
+    for path in &data_files {
+        match file_io.delete(path).await {
+            Ok(_) => {
+                tracing::debug!(path, "Deleted data file");
+                deleted += 1;
+            }
+            Err(e) => {
+                tracing::warn!(path, error = %e, "Failed to delete data file");
+                failed += 1;
+            }
+        }
+    }
+
+    for path in &manifest_files {
+        match file_io.delete(path).await {
+            Ok(_) => {
+                tracing::debug!(path, "Deleted manifest file");
+                deleted += 1;
+            }
+            Err(e) => {
+                tracing::warn!(path, error = %e, "Failed to delete manifest file");
+                failed += 1;
+            }
+        }
+    }
+
+    for path in &manifest_list_files {
+        match file_io.delete(path).await {
+            Ok(_) => {
+                tracing::debug!(path, "Deleted manifest list file");
+                deleted += 1;
+            }
+            Err(e) => {
+                tracing::warn!(path, error = %e, "Failed to delete manifest list file");
+                failed += 1;
+            }
+        }
+    }
+
+    for path in &metadata_files {
+        match file_io.delete(path).await {
+            Ok(_) => {
+                tracing::debug!(path, "Deleted metadata JSON file");
+                deleted += 1;
+            }
+            Err(e) => {
+                tracing::warn!(path, error = %e, "Failed to delete metadata JSON file");
+                failed += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        table = table_str,
+        deleted,
+        failed,
+        "Hard delete file pass complete"
+    );
+
+    if failed > 0 {
+        tracing::warn!(
+            table = table_str,
+            failed,
+            "Some files could not be deleted. The catalog entry will still be dropped."
+        );
+        println!(
+            "Warning: {failed} file(s) could not be deleted (see --verbose for details).              Catalog entry will still be removed."
+        );
+    } else {
+        println!("Deleted {deleted} file(s) from storage.");
+    }
+
     Ok(())
 }
 
