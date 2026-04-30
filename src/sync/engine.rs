@@ -214,6 +214,11 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         let mut cursor_text_value: String = String::new();
         let mut offset: usize = 0;
 
+        // Guard flags so ensure_table and evolve_schema are called at most
+        // once per job run rather than on every batch iteration.
+        let mut table_ready = false;
+        let mut schema_checked = false;
+
         loop {
             if job.cursor_column.is_some() {
                 // Bind :_cursor with the correct Postgres type.
@@ -287,15 +292,27 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
                             "[dry-run] would commit batch (skipped)"
                         );
                     } else {
-                        self.write_batch_atomic(job, rb, &new_watermark, n)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "Write batch (cursor={cursor_value}, offset={offset}) \
+                        self.write_batch_atomic(
+                            job,
+                            rb,
+                            &new_watermark,
+                            n,
+                            table_ready,
+                            schema_checked,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Write batch (cursor={cursor_value}, offset={offset}) \
                                  for job '{}'",
-                                    job.name
-                                )
-                            })?;
+                                job.name
+                            )
+                        })?;
+                        // After the first successful commit both the table and
+                        // schema are confirmed ready — skip catalog round-trips
+                        // on every subsequent batch.
+                        table_ready = true;
+                        schema_checked = true;
                     }
 
                     total_rows += n;
@@ -334,6 +351,8 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         batch: RecordBatch,
         watermark: &Option<DateTime<Utc>>,
         rows_written: usize,
+        table_ready: bool,
+        schema_checked: bool,
     ) -> Result<()> {
         let ident = table_ident(&job.namespace, &job.table).with_context(|| {
             format!(
@@ -359,15 +378,21 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
             batch.clone()
         };
 
-        self.ensure_table(&ident, &batch_for_schema, job)
-            .await
-            .with_context(|| {
-                format!(
-                    "ensure Iceberg table '{}' exists for job '{}'",
-                    ident, job.name
-                )
-            })?;
-        if job.schema_evolution.allow_add_columns {
+        // ── One-time table / schema setup ─────────────────────────────────────
+        // Both checks hit the catalog and are only meaningful on the very first
+        // batch.  Subsequent batches skip them entirely via the guard flags
+        // advanced by the caller after each successful commit.
+        if !table_ready {
+            self.ensure_table(&ident, &batch_for_schema, job)
+                .await
+                .with_context(|| {
+                    format!(
+                        "ensure Iceberg table '{}' exists for job '{}'",
+                        ident, job.name
+                    )
+                })?;
+        }
+        if job.schema_evolution.allow_add_columns && !schema_checked {
             self.evolve_schema(&ident, &batch_for_schema, &job.schema_evolution)
                 .await
                 .with_context(|| {
