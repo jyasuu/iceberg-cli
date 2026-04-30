@@ -115,6 +115,18 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         extra_params: Option<HashMap<String, SqlValue>>,
         retry: &RetryConfig,
     ) -> Result<RunSummary> {
+        // Every log event emitted anywhere inside this job (including nested
+        // async calls) will carry job=<name> automatically.
+        let span = tracing::info_span!(
+            "job",
+            job = %job.name,
+            mode = ?job.mode,
+            write_mode = ?job.write_mode,
+            source = %job.source,
+            table = %job.table,
+        );
+        let _enter = span.enter();
+
         let mut last_err = None;
         let mut delay_ms = retry.initial_delay_ms as f64;
 
@@ -125,7 +137,6 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
                     last_err = Some(e);
                     if attempt < retry.max_attempts {
                         warn!(
-                            job = %job.name,
                             attempt,
                             max = retry.max_attempts,
                             delay_ms,
@@ -168,9 +179,6 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         };
 
         info!(
-            job = %job.name,
-            mode = ?job.mode,
-            write_mode = ?job.write_mode,
             watermark = ?watermark,
             dry_run = self.dry_run,
             "Starting sync job"
@@ -274,7 +282,6 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
 
                     if self.dry_run {
                         info!(
-                            job = %job.name,
                             write_mode = ?job.write_mode,
                             rows = n,
                             "[dry-run] would commit batch (skipped)"
@@ -293,7 +300,6 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
 
                     total_rows += n;
                     info!(
-                        job = %job.name,
                         rows = n,
                         total_rows,
                         write_mode = ?job.write_mode,
@@ -308,7 +314,6 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         }
 
         info!(
-            job = %job.name,
             total_rows,
             write_mode = ?job.write_mode,
             "Job complete"
@@ -500,7 +505,6 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
             .with_context(|| format!("Failed to commit transaction for job '{}'", job.name))?;
 
         info!(
-            job = %job.name,
             write_mode = ?job.write_mode,
             rows_appended,
             rows_deleted,

@@ -36,6 +36,7 @@ mod config;
 mod sync;
 
 use std::{collections::HashMap, sync::Arc};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use anyhow::{Context, Result, bail};
 use arrow_array::{
@@ -112,6 +113,13 @@ struct Cli {
     /// Optional catalog name
     #[arg(long, default_value = "default")]
     catalog: String,
+
+    /// Enable verbose (DEBUG-level) logging.
+    ///
+    /// Use once (`-v`) for DEBUG, twice (`-vv`) for TRACE.
+    /// The RUST_LOG environment variable always takes precedence.
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
 
     #[command(subcommand)]
     cmd: Commands,
@@ -324,6 +332,37 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // ── Logging initialisation ────────────────────────────────────────────────
+    //
+    // Priority order (highest → lowest):
+    //   1. RUST_LOG environment variable  (always wins — useful in CI/CD)
+    //   2. -v / -vv CLI flags             (DEBUG / TRACE for iceberg_cli)
+    //   3. Default: WARN                  (silent unless something goes wrong)
+    //
+    // The `tracing` calls throughout the sync engine emit structured key=value
+    // fields; the human-readable formatter below prints them inline so verbose
+    // output is still grep-friendly.
+    let default_level = match cli.verbose {
+        0 => "warn",
+        1 => "iceberg_cli=debug",
+        _ => "iceberg_cli=trace",
+    };
+
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+
+    tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_target(false) // omit module path — keeps lines short
+                .with_thread_ids(false)
+                .compact(),
+        )
+        .with(filter)
+        .init();
+
+    tracing::debug!(version = env!("CARGO_PKG_VERSION"), "iceberg-cli starting");
+
     let catalog = connect(
         &cli.uri,
         &cli.catalog,
@@ -445,6 +484,11 @@ async fn connect(
         .await
         .with_context(|| format!("Failed to connect to REST catalog at {uri}"))?;
 
+    tracing::debug!(
+        catalog_uri = uri,
+        catalog_name = name,
+        "Connected to REST catalog"
+    );
     Ok(catalog)
 }
 
@@ -1515,6 +1559,19 @@ async fn cmd_sync(
     use std::collections::HashMap;
     use sync::engine::run_jobs_parallel;
 
+    // Attach a span so every tracing event emitted inside this call carries
+    // the config path and filters as structured fields — useful when multiple
+    // syncs run in CI logs.
+    let _span = tracing::info_span!(
+        "sync",
+        config = config_path,
+        job = ?only_job,
+        group = ?only_group,
+        dry_run,
+        parallel,
+    )
+    .entered();
+
     let cfg = SyncConfig::from_file(config_path)?;
     let engine = if dry_run {
         SyncEngine::with_dry_run(catalog)
@@ -1531,9 +1588,12 @@ async fn cmd_sync(
         .collect();
 
     if jobs.is_empty() {
+        tracing::warn!("No jobs matched the given filters — nothing to run");
         println!("No jobs to run.");
         return Ok(());
     }
+
+    tracing::info!(job_count = jobs.len(), "Starting sync run");
 
     if dry_run {
         println!("⚠  dry-run mode — no data will be written");
@@ -1553,13 +1613,25 @@ async fn cmd_sync(
     let results = run_jobs_parallel(&engine, &jobs, &source_dsn_map, &retry_map, parallel).await;
 
     let mut had_error = false;
+    let mut total_rows = 0usize;
+
     for (name, result) in results {
         match result {
-            Ok(summary) => println!(
-                "✓  {}  rows={}  watermark={:?}",
-                summary.job_name, summary.rows_written, summary.new_watermark
-            ),
+            Ok(summary) => {
+                total_rows += summary.rows_written;
+                tracing::info!(
+                    job = %summary.job_name,
+                    rows = summary.rows_written,
+                    watermark = ?summary.new_watermark,
+                    "Job succeeded"
+                );
+                println!(
+                    "✓  {}  rows={}  watermark={:?}",
+                    summary.job_name, summary.rows_written, summary.new_watermark
+                );
+            }
             Err(e) => {
+                tracing::error!(job = %name, error = %e, "Job failed");
                 eprintln!("✗  {}  error: {e:#}", name);
                 had_error = true;
             }
@@ -1567,8 +1639,11 @@ async fn cmd_sync(
     }
 
     if had_error {
+        tracing::error!(total_rows, "Sync run finished with errors");
         anyhow::bail!("One or more sync jobs failed");
     }
+
+    tracing::info!(total_rows, "Sync run complete");
     Ok(())
 }
 
