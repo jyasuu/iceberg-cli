@@ -1,5 +1,4 @@
 services:
-
   # ── Spark ────────────────────────────────────────────────────
   spark-iceberg:
     image: tabulario/spark-iceberg
@@ -115,8 +114,8 @@ services:
     networks:
       iceberg_net:
     ports:
-      - "5672:5672"    # AMQP
-      - "15672:15672"  # Management UI  (guest/guest)
+      - "5672:5672" # AMQP
+      - "15672:15672" # Management UI  (guest/guest)
     environment:
       - RABBITMQ_DEFAULT_USER=guest
       - RABBITMQ_DEFAULT_PASS=guest
@@ -126,6 +125,58 @@ services:
       timeout: 10s
       retries: 15
 
+  # ── Iceberg data initialiser ─────────────────────────────────────────────────
+  # Runs once to seed Iceberg with example data from PostgreSQL.
+  # Switch between two modes in sync-init.yaml:
+  #   Option A (default) – sync the real tables from postgres/init.sql
+  #   Option B           – generate 10 000 synthetic user rows via SQL
+  iceberg-init:
+    image: ghcr.io/jyasuu/iceberg-cli:main
+    container_name: iceberg-init
+    networks:
+      iceberg_net:
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rest:
+        condition: service_started
+      mc:
+        condition: service_started
+    volumes:
+      - ./sync-init.yaml:/sync-init.yaml:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        CLI="iceberg-cli --uri http://rest:8181 --s3-endpoint http://minio:9000"
+
+        echo "==> Syncing tables..."
+        $$CLI sync --config /sync-init.yaml
+
+        echo ""
+        echo "==> Scanning demo.products"
+        $$CLI scan --table demo.products
+
+        echo ""
+        echo "==> Scanning demo.orders"
+        $$CLI scan --table demo.orders
+
+        echo ""
+        echo "==> Scanning demo.order_items"
+        $$CLI scan --table demo.order_items
+
+        # Option B: uncomment if using generated data instead
+        echo ""
+        echo "==> Scanning demo.users_generated"
+        $$CLI scan --table demo.users_generated
+
+        echo ""
+        echo "==> Done."
+    restart: "no"
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
 
 networks:
   iceberg_net:
